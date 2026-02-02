@@ -2,23 +2,45 @@ import argparse
 import torch
 
 from utils import train_swinunetr_4fold_from_csv
-from main import CONFIG as MAIN_CONFIG
+
+try:
+    from main import CONFIG as _MAIN_CONFIG
+except Exception:
+    _MAIN_CONFIG = {}
+
+DEFAULT_ROOT_DIR = _MAIN_CONFIG.get("ROOT_DIR")
+DEFAULT_SPLIT_CSV = _MAIN_CONFIG.get("FOLD_CSV", "4fold_split.csv")
+DEFAULT_SCAN_NAME = _MAIN_CONFIG.get("SCAN_NAME_STAGE2", "Scan1Wave2")
+DEFAULT_MODELS_DIR = "swinunetr_models"
+DEFAULT_EPOCHS = _MAIN_CONFIG.get("NUM_EPOCHS", 10)
+DEFAULT_BATCH_SIZE = _MAIN_CONFIG.get("BATCH_SIZE", 4)
+DEFAULT_LR = _MAIN_CONFIG.get("LEARNING_RATE", 1e-4)
+DEFAULT_MAX_SLICES = _MAIN_CONFIG.get("MAX_SLICES", 48)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Train fold-specific SwinUNETR segmentors from 4fold_split.csv.")
-    default_root = MAIN_CONFIG.get("ROOT_DIR", None)
-    default_split = MAIN_CONFIG.get("FOLD_CSV", "4fold_split.csv")
-    default_scan = MAIN_CONFIG.get("SCAN_NAME_STAGE2", "Scan3Wave4")
-
-    ap.add_argument("--root_dir", default=default_root, help="Dataset root containing Scan*_FLAIR_brain and Scan*_WMH folders.")
-    ap.add_argument("--split_csv", default=default_split, help="CSV with columns patient_ID and split_id/fold.")
-    ap.add_argument("--scan_name", default=default_scan, help="Which timepoint to train segmentor on.")
-    ap.add_argument("--models_dir", default="swinunetr_models", help="Output directory for checkpoints + summary CSV.")
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--max_slices", type=int, default=48)
+    ap.add_argument(
+        "--root_dir",
+        required=DEFAULT_ROOT_DIR is None,
+        default=DEFAULT_ROOT_DIR,
+        help="Dataset root containing Scan*_FLAIR_brain and Scan*_WMH folders.",
+    )
+    ap.add_argument(
+        "--split_csv",
+        default=DEFAULT_SPLIT_CSV,
+        help="CSV with columns patient_ID and split_id/fold.",
+    )
+    ap.add_argument("--scan_name", default=DEFAULT_SCAN_NAME, help="Which timepoint to train segmentor on.")
+    ap.add_argument(
+        "--models_dir",
+        default=DEFAULT_MODELS_DIR,
+        help="Output directory for checkpoints + summary CSV.",
+    )
+    ap.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    ap.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
+    ap.add_argument("--lr", type=float, default=DEFAULT_LR)
+    ap.add_argument("--max_slices", type=int, default=DEFAULT_MAX_SLICES)
     ap.add_argument(
         "--val_offset",
         type=int,
@@ -49,9 +71,6 @@ def main():
         device = torch.device("cpu")
 
     require_wmh_presence = args.require_wmh_presence and (not args.allow_empty_wmh)
-
-    if args.root_dir is None:
-        raise ValueError("ROOT_DIR not set. Please provide --root_dir or set ROOT_DIR in main.py CONFIG.")
 
     train_swinunetr_4fold_from_csv(
         root_dir=args.root_dir,

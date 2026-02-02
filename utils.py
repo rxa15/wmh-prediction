@@ -21,8 +21,10 @@ from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import Dataset
 from torch_ema import ExponentialMovingAverage
 
-import_dir = '/'.join(os.path.realpath(__file__).split('/')[:-4])
-sys.path.insert(0, import_dir + '/ImageFlowNet/external_src/I2SB/')
+project_root = os.path.abspath(os.path.dirname(__file__))
+i2sb_dir = os.path.join(project_root, "ImageFlowNet", "external_src", "I2SB")
+if os.path.isdir(i2sb_dir) and i2sb_dir not in sys.path:
+    sys.path.insert(0, i2sb_dir)
 
 from guided_diffusion.unet import timestep_embedding
 
@@ -693,8 +695,7 @@ class SwinUNetSegmentation(nn.Module):
         )
 
     def forward(self, x):
-        logits = self.model(x)
-        return torch.sigmoid(logits)
+        return self.model(x)
 
 
 # ============================================================
@@ -1244,7 +1245,8 @@ def eval_segmentation(model, loader, device):
         for b in loader:
             x = b["flair"].to(device)
             y = b["mask"].to(device)
-            p = model(x)
+            logits = model(x)
+            p = torch.sigmoid(logits)
             p_bin = (p > 0.5).float()
             y_bin = (y > 0.5).float()
             dice_sum += float(_dice_coeff(p_bin, y_bin).item())
@@ -1256,7 +1258,7 @@ def train_swinunetr_4fold_from_csv(
     *,
     root_dir: str,
     split_csv_path: str,
-    scan_name: str = "Scan3Wave4",
+    scan_name: str = "Scan1Wave2",
     max_slices_per_patient=48,
     batch_size: int = 4,
     num_epochs: int = 10,
@@ -1374,8 +1376,9 @@ def train_segmentation(model, loader, opt, device):
     tot = 0
     for b in tqdm(loader, desc="[Stage2 Train]"):
         x, y = b["flair"].to(device), b["mask"].to(device)
-        p = model(x)
-        loss = dice_loss(p, y) + nn.functional.binary_cross_entropy(p, y)
+        logits = model(x)
+        probs = torch.sigmoid(logits)
+        loss = dice_loss(probs, y) + nn.functional.binary_cross_entropy_with_logits(logits, y)
         opt.zero_grad()
         loss.backward()
         opt.step()
