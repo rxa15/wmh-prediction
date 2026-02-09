@@ -55,14 +55,41 @@ def load_model(checkpoint_path, device):
     return model
 
 
+def normalize_flair(flair_tensor):
+    """Normalize FLAIR tensor to [0, 1] range."""
+    # Normalize per sample in the batch
+    batch_size = flair_tensor.shape[0]
+    normalized = torch.zeros_like(flair_tensor)
+    
+    for i in range(batch_size):
+        sample = flair_tensor[i]
+        min_val = sample.min()
+        max_val = sample.max()
+        
+        if max_val > min_val:
+            normalized[i] = (sample - min_val) / (max_val - min_val)
+        else:
+            normalized[i] = sample
+    
+    return normalized
+
+
 def predict_batch(model, batch, device):
     """Run inference on a batch of FLAIR images."""
     with torch.no_grad():
         flair = batch["flair"].to(device)
+        
+        # Normalize FLAIR to [0, 1]
+        flair = normalize_flair(flair)
+        
+        # Ensure input is in [0, 1] range
+        flair = torch.clamp(flair, 0.0, 1.0)
+        
         logits = model(flair)
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits)  # Output is already [0, 1] due to sigmoid
         pred_masks = (probs > 0.5).float()
-    return probs, pred_masks
+    
+    return probs, pred_masks, flair
 
 
 def compute_metrics(pred_masks, gt_masks):
@@ -166,17 +193,26 @@ def run_inference_single_fold(
     os.makedirs(pred_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
     
+    # Prepare per-slice results file
+    results_txt_path = os.path.join(output_dir, fold_name, f"{fold_name}_per_slice_results.txt")
+    results_file = open(results_txt_path, 'w')
+    results_file.write("="*80 + "\n")
+    results_file.write(f"Per-Slice Results for {fold_name}\n")
+    results_file.write("="*80 + "\n")
+    results_file.write(f"{'Patient ID':<20} {'Slice':<8} {'Dice':<10} {'IoU':<10} {'FLAIR Min':<12} {'FLAIR Max':<12} {'Pred Min':<12} {'Pred Max':<12}\n")
+    results_file.write("-"*80 + "\n")
+    
     vis_count = 0
     
     print(f"\n🔍 Running inference for {fold_name}...")
     for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"Inference [{fold_name}]")):
         # Get predictions
-        probs, pred_masks = predict_batch(model, batch, device)
+        probs, pred_masks, normalized_flair = predict_batch(model, batch, device)
         
         # Get ground truth
         gt_masks = batch["mask"].to(device)
         
-        # Compute metrics
+        # Compute metrics and log per-slice results
         for i in range(len(pred_masks)):
             dice = float(_dice_coeff(pred_masks[i], gt_masks[i]).item())
             all_dice_scores.append(dice)
@@ -188,6 +224,19 @@ def run_inference_single_fold(
             union = pred_flat.sum() + gt_flat.sum() - intersection
             iou = float(intersection / (union + 1e-6))
             all_iou_scores.append(iou)
+            
+            # Get slice information
+            patient_id = batch['patient_id'][i]
+            slice_idx = batch['slice_idx'][i].item() if hasattr(batch['slice_idx'][i], 'item') else batch['slice_idx'][i]
+            
+            # Get FLAIR and prediction value ranges
+            flair_min = float(normalized_flair[i].min().item())
+            flair_max = float(normalized_flair[i].max().item())
+            pred_min = float(pred_masks[i].min().item())
+            pred_max = float(pred_masks[i].max().item())
+            
+            # Write to results file
+            results_file.write(f"{patient_id:<20} {slice_idx:<8} {dice:<10.6f} {iou:<10.6f} {flair_min:<12.6f} {flair_max:<12.6f} {pred_min:<12.6f} {pred_max:<12.6f}\n")
         
         # Save predictions (optional)
         if save_nifti:
@@ -199,7 +248,7 @@ def run_inference_single_fold(
                 patient_id = batch['patient_id'][i]
                 slice_idx = batch['slice_idx'][i].item() if hasattr(batch['slice_idx'][i], 'item') else batch['slice_idx'][i]
                 
-                flair_np = batch['flair'][i].cpu().numpy()
+                flair_np = normalized_flair[i].cpu().numpy()
                 pred_np = pred_masks[i].cpu().numpy()
                 gt_np = gt_masks[i].cpu().numpy()
                 
@@ -209,6 +258,19 @@ def run_inference_single_fold(
             
             if vis_count >= num_vis_samples:
                 break
+    
+    # Close results file and write summary
+    results_file.write("-"*80 + "\n")
+    results_file.write("\n" + "="*80 + "\n")
+    results_file.write("SUMMARY STATISTICS\n")
+    results_file.write("="*80 + "\n")
+    results_file.write(f"Total slices: {len(all_dice_scores)}\n")
+    results_file.write(f"Dice Score:   {np.mean(all_dice_scores):.6f} ± {np.std(all_dice_scores):.6f} (median: {np.median(all_dice_scores):.6f})\n")
+    results_file.write(f"IoU Score:    {np.mean(all_iou_scores):.6f} ± {np.std(all_iou_scores):.6f} (median: {np.median(all_iou_scores):.6f})\n")
+    results_file.write("="*80 + "\n")
+    results_file.close()
+    
+    print(f"✓ Per-slice results saved to: {results_txt_path}")
     
     # Compute overall metrics
     metrics = {
