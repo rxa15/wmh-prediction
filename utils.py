@@ -20,6 +20,7 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import Dataset
 from torch_ema import ExponentialMovingAverage
+from torch.nn.utils import clip_grad_norm_
 
 project_root = os.path.abspath(os.path.dirname(__file__))
 i2sb_dir = os.path.join(project_root, "ImageFlowNet", "external_src", "I2SB")
@@ -228,7 +229,7 @@ class BinaryDice(nn.Module):
             # Should not happen if valid_sample_count > 0, but safety check
             return torch.tensor(0.0, dtype=torch.float32)
 
-        dice = (2.0 * self.intersection_sum + self.eps) / (union + self.eps)
+        dice = (2.0 * self.intersection_sum + self.eps) / (union + self.eps) # self.eps ditaro di luar sebelum perhitungannya
         return torch.tensor(dice, dtype=torch.float32)
 
     def compute_fp_rate(self):
@@ -912,6 +913,69 @@ def visualize_results(source, ground_truth, predicted, patient_ids, slice_indice
     plt.close()
     print(f"Visual results saved to {save_path}")
 
+def plot_segmentation_history(history, fold_idx, save_dir="plots"):
+    """Plots and saves the training history for segmentation models.
+    
+    Args:
+        history: Dictionary with keys 'train_loss', 'val_dice', 'learning_rate'
+        fold_idx: Fold number for labeling
+        save_dir: Directory to save plots and CSV
+    """
+    import pandas as pd
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"swinunetr_training_history_fold_{fold_idx}.png")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    epochs = range(1, len(history['train_loss']) + 1)
+
+    # Plot 1: Loss and Dice Score
+    color_loss = 'tab:red'
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Training Loss', color=color_loss, fontsize=12)
+    ax1.plot(epochs, history['train_loss'], 'o-', color=color_loss, linewidth=2, markersize=6, label='Train Loss')
+    ax1.tick_params(axis='y', labelcolor=color_loss)
+    ax1.set_ylim(bottom=0)
+    ax1.grid(True, alpha=0.3)
+
+    ax1_twin = ax1.twinx()
+    color_dice = 'tab:blue'
+    ax1_twin.set_ylabel('Validation Dice Score', color=color_dice, fontsize=12)
+    ax1_twin.plot(epochs, history['val_dice'], 's-', color=color_dice, linewidth=2, markersize=6, label='Val Dice')
+    ax1_twin.tick_params(axis='y', labelcolor=color_dice)
+    ax1_twin.set_ylim([0, 1.05])
+
+    # Add legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax1_twin.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
+
+    ax1.set_title(f'SwinUNETR Training - Test Fold {fold_idx}', fontsize=14, fontweight='bold')
+
+    # Plot 2: Learning Rate Schedule
+    ax2.plot(epochs, history['learning_rate'], 'g-', linewidth=2, marker='o', markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Learning Rate', fontsize=12)
+    ax2.set_title('Learning Rate Schedule', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"📈 Training history plot saved to {save_path}")
+
+    # Save history data to CSV
+    history_data = {'epoch': list(epochs)}
+    for key, values in history.items():
+        history_data[key] = values
+
+    history_df = pd.DataFrame(history_data)
+    csv_path = os.path.join(save_dir, f"swinunetr_training_history_fold_{fold_idx}.csv")
+    history_df.to_csv(csv_path, index=False)
+    print(f"📊 Training history data saved to {csv_path}")
+
+
 def plot_fold_history(history, fold_idx, save_dir="plots"):
     """Plots and saves the training and validation history for a fold."""
     import pandas as pd
@@ -1238,6 +1302,7 @@ def _dice_coeff(pred_bin: torch.Tensor, gt_bin: torch.Tensor, eps: float = 1e-6)
 
 
 def eval_segmentation(model, loader, device):
+    """Evaluate segmentation model with proper normalization."""
     model.eval()
     dice_sum = 0.0
     n = 0
@@ -1245,7 +1310,22 @@ def eval_segmentation(model, loader, device):
         for b in loader:
             x = b["flair"].to(device)
             y = b["mask"].to(device)
-            logits = model(x)
+            
+            # Per-sample min-max normalization (consistent with inference)
+            batch_size = x.shape[0]
+            x_normalized = torch.zeros_like(x)
+            for i in range(batch_size):
+                sample = x[i]
+                min_val = sample.min()
+                max_val = sample.max()
+                if max_val > min_val:
+                    x_normalized[i] = (sample - min_val) / (max_val - min_val)
+                else:
+                    x_normalized[i] = sample
+            x_normalized = torch.clamp(x_normalized, 0.0, 1.0)
+            
+            # Forward pass
+            logits = model(x_normalized)
             p = torch.sigmoid(logits)
             p_bin = (p > 0.5).float()
             y_bin = (y > 0.5).float()
@@ -1309,6 +1389,8 @@ def train_swinunetr_4fold_from_csv(
             split_to_indices[s].append(i)
 
     rows = []
+    all_histories = {}  # Store training history for each fold
+    
     for test_split in all_splits:
         # Choose validation split deterministically so you get exactly 4 models.
         val_split = all_splits[(all_splits.index(test_split) + int(val_offset)) % len(all_splits)]
@@ -1333,10 +1415,23 @@ def train_swinunetr_4fold_from_csv(
 
         best_val_dice = -1.0
         best_path = os.path.join(models_dir, f"wmh_swinunetr_test{test_split}_val{val_split}.pth")
+        
+        # Track training history
+        history = {
+            'train_loss': [],
+            'val_dice': [],
+            'learning_rate': []
+        }
 
         for ep in range(num_epochs):
             loss = train_segmentation(model, train_loader, opt, device)
             val_dice = eval_segmentation(model, val_loader, device)
+            
+            # Record history
+            history['train_loss'].append(loss)
+            history['val_dice'].append(val_dice)
+            history['learning_rate'].append(opt.param_groups[0]['lr'])
+            
             print(
                 f"[SwinUNETR CV] test={test_split} val={val_split} "
                 f"epoch={ep+1}/{num_epochs} loss={loss:.4f} val_dice={val_dice:.4f}"
@@ -1345,6 +1440,9 @@ def train_swinunetr_4fold_from_csv(
                 best_val_dice = val_dice
                 torch.save(model.state_dict(), best_path)
 
+        # Store history for this fold
+        all_histories[test_split] = history
+        
         # Load best weights and score on test.
         model.load_state_dict(torch.load(best_path, map_location=device))
         model.eval()
@@ -1368,19 +1466,57 @@ def train_swinunetr_4fold_from_csv(
     summary_path = os.path.join(models_dir, "swinunetr_4fold_summary.csv")
     df.to_csv(summary_path, index=False)
     print(f"[SwinUNETR CV] Summary saved to {summary_path}")
-    return df
+    return df, all_histories
 
 
-def train_segmentation(model, loader, opt, device):
+def train_segmentation(model, loader, opt, device, max_grad_norm=1.0):
+    """Train segmentation model with proper normalization and gradient clipping.
+    
+    Args:
+        model: Segmentation model
+        loader: DataLoader
+        opt: Optimizer
+        device: torch device
+        max_grad_norm: Maximum gradient norm for clipping (default: 1.0)
+    
+    Returns:
+        Average loss for the epoch
+    """
     model.train()
     tot = 0
     for b in tqdm(loader, desc="[Stage2 Train]"):
         x, y = b["flair"].to(device), b["mask"].to(device)
-        logits = model(x)
+        
+        # Per-sample min-max normalization (consistent with inference)
+        batch_size = x.shape[0]
+        x_normalized = torch.zeros_like(x)
+        for i in range(batch_size):
+            sample = x[i]
+            min_val = sample.min()
+            max_val = sample.max()
+            if max_val > min_val:
+                x_normalized[i] = (sample - min_val) / (max_val - min_val)
+            else:
+                x_normalized[i] = sample
+        x_normalized = torch.clamp(x_normalized, 0.0, 1.0)
+        
+        # Ensure mask is properly binarized
+        y_bin = (y > 0.5).float()
+        
+        # Forward pass
+        logits = model(x_normalized)
+        
+        # Combined loss: Dice + BCE (BCE with logits applies sigmoid internally)
         probs = torch.sigmoid(logits)
-        loss = dice_loss(probs, y) + nn.functional.binary_cross_entropy_with_logits(logits, y)
+        loss = dice_loss(probs, y_bin) + nn.functional.binary_cross_entropy_with_logits(logits, y_bin)
+        
+        # Backward pass with gradient clipping
         opt.zero_grad()
         loss.backward()
+        
+        # Clip gradients to prevent exploding gradients
+        clip_grad_norm_(model.parameters(), max_grad_norm)
+        
         opt.step()
         tot += loss.item()
     return tot / len(loader)
@@ -1406,19 +1542,37 @@ def run_stage2_segmentation(pred_flair_dir, wmh_gt_dir, device, models_dir):
 
 
 def segment_3d_volume(model, volume_3d, device):
-    """Segment a 3D volume slice by slice."""
+    """Segment a 3D volume slice by slice with proper normalization.
+    
+    Args:
+        model: Trained segmentation model
+        volume_3d: 3D numpy array (H, W, D)
+        device: torch device
+    
+    Returns:
+        3D binary segmentation mask (same shape as input)
+    """
     model.eval()
     segmented_volume = np.zeros_like(volume_3d)
 
     with torch.no_grad():
         for slice_idx in range(volume_3d.shape[2]):
             slice_data = volume_3d[:, :, slice_idx]
+            
+            # Per-slice min-max normalization (consistent with training)
             if slice_data.max() - slice_data.min() > 1e-8:
                 slice_data = (slice_data - slice_data.min()) / (slice_data.max() - slice_data.min())
+            
+            # Clamp to [0, 1] for safety
+            slice_data = np.clip(slice_data, 0.0, 1.0)
 
             slice_tensor = torch.from_numpy(slice_data).unsqueeze(0).unsqueeze(0).float().to(device)
-            pred_mask = model(slice_tensor)
-            pred_mask_binary = (pred_mask > 0.5).float()
+            
+            # Forward pass (model outputs logits, apply sigmoid for probabilities)
+            logits = model(slice_tensor)
+            probs = torch.sigmoid(logits)
+            pred_mask_binary = (probs > 0.5).float()
+            
             segmented_volume[:, :, slice_idx] = pred_mask_binary.squeeze().cpu().numpy()
 
     return segmented_volume

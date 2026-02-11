@@ -1,7 +1,8 @@
 import argparse
+import os
 import torch
 
-from utils import train_swinunetr_4fold_from_csv
+from utils import train_swinunetr_4fold_from_csv, plot_segmentation_history
 
 try:
     from main import CONFIG as _MAIN_CONFIG
@@ -72,7 +73,8 @@ def main():
 
     require_wmh_presence = args.require_wmh_presence and (not args.allow_empty_wmh)
 
-    train_swinunetr_4fold_from_csv(
+    # Train models and get results with training histories
+    results_df, training_histories = train_swinunetr_4fold_from_csv(
         root_dir=args.root_dir,
         split_csv_path=args.split_csv,
         scan_name=args.scan_name,
@@ -85,6 +87,22 @@ def main():
         val_offset=args.val_offset,
         require_wmh_presence=require_wmh_presence,
     )
+    
+    # Generate training history plots for each fold
+    print("\n" + "="*60)
+    print("📊 Generating training history visualizations...")
+    print("="*60)
+    
+    plots_dir = os.path.join(args.models_dir, "training_plots")
+    for fold_idx, history in training_histories.items():
+        plot_segmentation_history(history, fold_idx, save_dir=plots_dir)
+    
+    print(f"\n✅ Training complete! Check {args.models_dir} for:")
+    print(f"   - Model checkpoints: wmh_swinunetr_test*_val*.pth")
+    print(f"   - Summary CSV: swinunetr_4fold_summary.csv")
+    print(f"   - Training plots: {plots_dir}/")
+    print(f"\n📈 Summary of results:")
+    print(results_df.to_string(index=False))
 
 
 if __name__ == "__main__":
