@@ -558,20 +558,31 @@ class FLAIREvolutionDataset(Dataset):
         return vmin, vmax
 
     def _load_slice(self, file_path, slice_idx, vmin=None, vmax=None):
-        """Load a single slice with optional volume-wise normalization using (vmin, vmax)."""
-        # Use nibabel proxy slicing to avoid reading the full 3D volume for every slice.
         img = nib.load(file_path)
         img_slice = np.asanyarray(img.dataobj[:, :, slice_idx], dtype=np.float32)
+        
+        # Check for NaN/Inf in loaded data
+        if np.isnan(img_slice).any() or np.isinf(img_slice).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in {file_path}, slice {slice_idx}")
+            img_slice = np.nan_to_num(img_slice, nan=0.0, posinf=0.0, neginf=0.0)
+        
         if vmin is not None and vmax is not None:
             denom = (vmax - vmin)
             if denom > 1e-8:
                 img_slice = (img_slice - vmin) / denom
+            else:
+                # Constant slice - set to 0
+                img_slice = np.zeros_like(img_slice)
         else:
-            # Fallback: per-slice min-max (legacy behavior)
+            # Fallback: per-slice min-max
             smin = float(img_slice.min())
             smax = float(img_slice.max())
             if smax - smin > 1e-8:
                 img_slice = (img_slice - smin) / (smax - smin)
+            else:
+                # Constant slice - set to 0
+                img_slice = np.zeros_like(img_slice)
+        
         return torch.from_numpy(img_slice).unsqueeze(0)
 
     def __len__(self):
@@ -1329,11 +1340,11 @@ def eval_segmentation(model, loader, device):
                     x_normalized[i] = sample
             x_normalized = torch.clamp(x_normalized, 0.0, 1.0)
             
-            # Forward pass (model returns probabilities)
-            p = model(x_normalized)
+            # Forward pass (model returns logits)
+            logits = model(x_normalized)
             
             # Clamp to valid range (prevents floating-point errors)
-            p = torch.clamp(p, min=0.0, max=1.0)
+            p = torch.clamp(torch.sigmoid(logits), min=0.0, max=1.0)
             
             p_bin = (p > 0.5).float()
             y_bin = (y > 0.5).float()
@@ -1491,8 +1502,17 @@ def train_segmentation(model, loader, opt, device, max_grad_norm=1.0):
     # BCE *with* logits (includes sigmoid automatically)
     bce = nn.BCEWithLogitsLoss()
 
-    for b in tqdm(loader, desc="[Stage2 Train]"):
+    for batch_idx, b in enumerate(tqdm(loader, desc="[Stage2 Train]")):
         x, y = b["flair"].to(device), b["mask"].to(device)
+        
+        # 🐛 DEBUG: Check input data
+        if batch_idx == 0:
+            print(f"\n🔍 DEBUG - Batch 0:")
+            print(f"   Input range: [{x.min():.4f}, {x.max():.4f}]")
+            print(f"   Target range: [{y.min():.4f}, {y.max():.4f}]")
+            print(f"   Input has NaN: {torch.isnan(x).any()}")
+            print(f"   Target has NaN: {torch.isnan(y).any()}")
+            print(f"   Target positive pixels: {(y > 0.5).sum().item()}/{y.numel()}")
 
         # ---- per‑slice min‑max (same as before) ----
         batch_size = x.shape[0]
@@ -1505,17 +1525,48 @@ def train_segmentation(model, loader, opt, device, max_grad_norm=1.0):
             else:
                 x_norm[i] = s
         x_norm = torch.clamp(x_norm, 0.0, 1.0)
+        
+        # 🐛 DEBUG: Check normalized input
+        if batch_idx == 0:
+            print(f"   Normalized range: [{x_norm.min():.4f}, {x_norm.max():.4f}]")
+            print(f"   Normalized has NaN: {torch.isnan(x_norm).any()}")
 
         # ---- forward pass (logits) ----
-        logits = model(x_norm)                # raw logits
+        logits = model(x_norm)
+        
+        # 🐛 DEBUG: Check model output
+        if batch_idx == 0:
+            print(f"   Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+            print(f"   Logits has NaN: {torch.isnan(logits).any()}")
+            print(f"   Logits has Inf: {torch.isinf(logits).any()}")
 
         # ---- combine Dice loss with BCEWithLogitsLoss ----
-        # Dice loss still works on probabilities, so we apply sigmoid *only* for it
-        p_prob = torch.sigmoid(logits)       # [0,1] for Dice only
+        p_prob = torch.sigmoid(logits)
+        
+        # 🐛 DEBUG: Check probabilities
+        if batch_idx == 0:
+            print(f"   Probs range: [{p_prob.min():.4f}, {p_prob.max():.4f}]")
+        
         loss_dice = dice_loss(p_prob, (y > 0.5).float())
-        loss_bce  = bce(logits, (y > 0.5).float())   # target must be 0/1, not probabilities
+        loss_bce  = bce(logits, (y > 0.5).float())
+        
+        # 🐛 DEBUG: Check losses
+        if batch_idx == 0:
+            print(f"   Dice loss: {loss_dice.item():.4f}")
+            print(f"   BCE loss: {loss_bce.item():.4f}")
 
         loss = loss_dice + loss_bce
+        
+        # 🐛 DEBUG: Check combined loss
+        if batch_idx == 0:
+            print(f"   Combined loss: {loss.item():.4f}")
+            print(f"   Loss is NaN: {torch.isnan(loss)}")
+            print(f"   Loss is Inf: {torch.isinf(loss)}\n")
+        
+        # 🐛 SAFETY: Skip NaN batches
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"⚠️  WARNING: Skipping batch {batch_idx} due to NaN/Inf loss")
+            continue
 
         opt.zero_grad()
         loss.backward()
@@ -1524,7 +1575,7 @@ def train_segmentation(model, loader, opt, device, max_grad_norm=1.0):
 
         tot += loss.item()
 
-    return tot / len(loader)
+    return tot / max(len(loader), 1)
 
 
 def run_stage2_segmentation(pred_flair_dir, wmh_gt_dir, device, models_dir):
