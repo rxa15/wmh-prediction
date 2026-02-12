@@ -319,20 +319,18 @@ class DiceLoss(nn.Module):
     """
     Dice Loss for binary segmentation.
 
-    IMPORTANT: Pass LOGITS (before sigmoid), not probabilities.
-    This loss applies sigmoid internally.
+    IMPORTANT: Now expects PROBABILITIES (after sigmoid), not logits.
     """
-    def __init__(self, smooth=1e-6):
+    def __init__(self, smooth=1.0):
         super(DiceLoss, self).__init__()
         self.smooth = smooth
 
-    def forward(self, logits, targets):
+    def forward(self, probs, targets):
         """
         Args:
-            logits: Raw model outputs (before sigmoid) - shape (N, 1, H, W)
+            probs: Predicted probabilities (after sigmoid) - shape (N, 1, H, W)
             targets: Binary ground truth (0 or 1) - shape (N, 1, H, W)
         """
-        probs = torch.sigmoid(logits)
         probs = probs.reshape(-1)
         targets = targets.reshape(-1)
         intersection = (probs * targets).sum()
@@ -342,14 +340,13 @@ class DiceLoss(nn.Module):
 
 
 class DiceMetric:
-    def __init__(self, smooth=1e-6):
+    def __init__(self, smooth=1.0):
         self.smooth = smooth
         self.intersection = 0.0
         self.union = 0.0
 
-    def update(self, logits: torch.Tensor, target: torch.Tensor):
-        preds = torch.sigmoid(logits)
-        preds = preds.reshape(-1)
+    def update(self, probs: torch.Tensor, target: torch.Tensor):
+        preds = probs.reshape(-1)
         target = target.reshape(-1)
         self.intersection += (preds * target).sum()
         self.union += preds.sum() + target.sum()
@@ -365,7 +362,8 @@ class DiceMetric:
         self.union = 0.0
 
 
-def dice_loss(pred, gt, eps=1e-6):
+def dice_loss(pred, gt, eps=1.0):
+    """Dice loss for probabilities (after sigmoid)."""
     p, g = pred.reshape(-1), gt.reshape(-1)
     inter = (p * g).sum()
     return 1 - (2*inter + eps) / (p.sum() + g.sum() + eps)
@@ -1294,11 +1292,18 @@ class EvolutionSegmentationDataset(Dataset):
         }
 
 
-def _dice_coeff(pred_bin: torch.Tensor, gt_bin: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _dice_coeff(pred_bin: torch.Tensor, gt_bin: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+    """Compute Dice coefficient for binary masks."""
     pred = pred_bin.reshape(-1)
     gt = gt_bin.reshape(-1)
     inter = (pred * gt).sum()
-    return (2.0 * inter + eps) / (pred.sum() + gt.sum() + eps)
+    union = pred.sum() + gt.sum()
+    
+    # Handle edge case: both empty
+    if union < eps and gt.sum() < eps:
+        return torch.tensor(1.0, device=pred_bin.device)  # Perfect match
+    
+    return (2.0 * inter + eps) / (union + eps)
 
 
 def eval_segmentation(model, loader, device):
@@ -1324,13 +1329,20 @@ def eval_segmentation(model, loader, device):
                     x_normalized[i] = sample
             x_normalized = torch.clamp(x_normalized, 0.0, 1.0)
             
-            # Forward pass
-            logits = model(x_normalized)
-            p = torch.sigmoid(logits)
+            # Forward pass (model returns probabilities)
+            p = model(x_normalized)
+            
+            # Clamp to valid range (prevents floating-point errors)
+            p = torch.clamp(p, min=0.0, max=1.0)
+            
             p_bin = (p > 0.5).float()
             y_bin = (y > 0.5).float()
-            dice_sum += float(_dice_coeff(p_bin, y_bin).item())
-            n += 1
+            
+            # Compute dice and check validity
+            dice_val = _dice_coeff(p_bin, y_bin)
+            if not torch.isnan(dice_val) and not torch.isinf(dice_val):
+                dice_sum += float(dice_val.item())
+                n += 1
     return dice_sum / max(n, 1)
 
 
@@ -1469,56 +1481,49 @@ def train_swinunetr_4fold_from_csv(
     return df, all_histories
 
 
+# -------------------------------------------------
+#  Training step
+# -------------------------------------------------
 def train_segmentation(model, loader, opt, device, max_grad_norm=1.0):
-    """Train segmentation model with proper normalization and gradient clipping.
-    
-    Args:
-        model: Segmentation model
-        loader: DataLoader
-        opt: Optimizer
-        device: torch device
-        max_grad_norm: Maximum gradient norm for clipping (default: 1.0)
-    
-    Returns:
-        Average loss for the epoch
-    """
     model.train()
-    tot = 0
+    tot = 0.0
+
+    # BCE *with* logits (includes sigmoid automatically)
+    bce = nn.BCEWithLogitsLoss()
+
     for b in tqdm(loader, desc="[Stage2 Train]"):
         x, y = b["flair"].to(device), b["mask"].to(device)
-        
-        # Per-sample min-max normalization (consistent with inference)
+
+        # ---- per‑slice min‑max (same as before) ----
         batch_size = x.shape[0]
-        x_normalized = torch.zeros_like(x)
+        x_norm = torch.zeros_like(x)
         for i in range(batch_size):
-            sample = x[i]
-            min_val = sample.min()
-            max_val = sample.max()
-            if max_val > min_val:
-                x_normalized[i] = (sample - min_val) / (max_val - min_val)
+            s = x[i]
+            mi, ma = s.min(), s.max()
+            if ma > mi:
+                x_norm[i] = (s - mi) / (ma - mi)
             else:
-                x_normalized[i] = sample
-        x_normalized = torch.clamp(x_normalized, 0.0, 1.0)
-        
-        # Ensure mask is properly binarized
-        y_bin = (y > 0.5).float()
-        
-        # Forward pass
-        logits = model(x_normalized)
-        
-        # Combined loss: Dice + BCE (BCE with logits applies sigmoid internally)
-        probs = torch.sigmoid(logits)
-        loss = dice_loss(probs, y_bin) + nn.functional.binary_cross_entropy_with_logits(logits, y_bin)
-        
-        # Backward pass with gradient clipping
+                x_norm[i] = s
+        x_norm = torch.clamp(x_norm, 0.0, 1.0)
+
+        # ---- forward pass (logits) ----
+        logits = model(x_norm)                # raw logits
+
+        # ---- combine Dice loss with BCEWithLogitsLoss ----
+        # Dice loss still works on probabilities, so we apply sigmoid *only* for it
+        p_prob = torch.sigmoid(logits)       # [0,1] for Dice only
+        loss_dice = dice_loss(p_prob, (y > 0.5).float())
+        loss_bce  = bce(logits, (y > 0.5).float())   # target must be 0/1, not probabilities
+
+        loss = loss_dice + loss_bce
+
         opt.zero_grad()
         loss.backward()
-        
-        # Clip gradients to prevent exploding gradients
         clip_grad_norm_(model.parameters(), max_grad_norm)
-        
         opt.step()
+
         tot += loss.item()
+
     return tot / len(loader)
 
 
@@ -1568,9 +1573,9 @@ def segment_3d_volume(model, volume_3d, device):
 
             slice_tensor = torch.from_numpy(slice_data).unsqueeze(0).unsqueeze(0).float().to(device)
             
-            # Forward pass (model outputs logits, apply sigmoid for probabilities)
-            logits = model(slice_tensor)
-            probs = torch.sigmoid(logits)
+            # Forward pass (model returns probabilities directly)
+            probs = model(slice_tensor)
+            probs = torch.clamp(probs, 0.0, 1.0)  # Safety clamp
             pred_mask_binary = (probs > 0.5).float()
             
             segmented_volume[:, :, slice_idx] = pred_mask_binary.squeeze().cpu().numpy()
