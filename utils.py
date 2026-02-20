@@ -1624,8 +1624,9 @@ def segment_3d_volume(model, volume_3d, device):
 
             slice_tensor = torch.from_numpy(slice_data).unsqueeze(0).unsqueeze(0).float().to(device)
             
-            # Forward pass (model returns probabilities directly)
-            probs = model(slice_tensor)
+            # Forward pass (model returns logits, apply sigmoid to get probabilities)
+            logits = model(slice_tensor)
+            probs = torch.sigmoid(logits)
             probs = torch.clamp(probs, 0.0, 1.0)  # Safety clamp
             pred_mask_binary = (probs > 0.5).float()
             
