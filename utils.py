@@ -1117,9 +1117,9 @@ def evaluate_and_visualize_tasks(model_path, source_loader, gt_loaders, device, 
 
     # Updated tasks for t1->t2 (interpolation), t1->t3 (training), t1->t4 (extrapolation)
     tasks = {
-        "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": 1.0},  # t1 -> t2 (Δt=1.0)
-        "Training_t3":      {"scan_pair": "Scan3Wave4", "time": 2.0},  # t1 -> t3 (Δt=2.0, trained)
-        "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": 3.0},  # t1 -> t4 (Δt=3.0)
+        "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": 3.0},  # t1 -> t2 (Δt=3.0)
+        "Training_t3":      {"scan_pair": "Scan3Wave4", "time": 6.0},  # t1 -> t3 (Δt=6.0, trained)
+        "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": 9.0},  # t1 -> t4 (Δt=9.0)
     }
     metrics = {name: {
         "psnr": torchmetrics.PeakSignalNoiseRatio(data_range=1.0).to(device),

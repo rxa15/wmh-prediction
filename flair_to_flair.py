@@ -171,7 +171,7 @@ class Experiment1(BaseExperiment):
         # Define training pairs: t1 -> t3 only
         # Scan1Wave2 (t1) -> Scan3Wave4 (t3) with time_delta = 2.0
         training_pairs = [
-            ("Scan1Wave2", "Scan3Wave4", 2.0)  # Train on t1 -> t3
+            ("Scan1Wave2", "Scan3Wave4", 6.0)  # Train on t1 -> t3
         ]
         
         # Initialize dataset with custom training pairs
@@ -269,13 +269,10 @@ class Experiment1(BaseExperiment):
         best_val_ssim = 0.0
         model_save_path = self.get_model_path(test_fold_idx)
         
+        # History: track training loss (running average) and validation metrics
         history = {
             'train_recon_loss': [],
             'train_pred_loss': [],
-            'train_recon_psnr': [],   
-            'train_pred_psnr': [],    
-            'train_delta_psnr': [],
-            'train_pred_ssim': [],
             'val_recon_psnr': [],
             'val_pred_psnr': [],
             'val_delta_psnr': [],
@@ -294,26 +291,6 @@ class Experiment1(BaseExperiment):
                 self.config["NUM_EPOCHS"], self.config["CONTRASTIVE_COEFF"]
             )
             
-            # Validation metrics
-            with ema.average_parameters():
-                val_recon_psnr, val_pred_psnr = val_epoch(model, val_loader, self.config["DEVICE"])
-                # Calculate SSIM for WMH-structure evaluation
-                val_pred_ssim = self._compute_ssim(model, val_loader)
-            
-            # Training metrics: evaluate on FULL training set (not sampled)
-            # Evaluate every N epochs to save time
-            train_eval_frequency = self.config.get("TRAIN_EVAL_EVERY", 5)
-            if (epoch + 1) % train_eval_frequency == 0 or epoch == 0:
-                with torch.no_grad(), ema.average_parameters():
-                    train_eval_loader = DataLoader(
-                        Subset(full_dataset, train_indices),
-                        batch_size=self.config["BATCH_SIZE"],
-                        shuffle=False,
-                        num_workers=0
-                    )
-                    train_recon_psnr, train_pred_psnr = val_epoch(model, train_eval_loader, self.config["DEVICE"])
-                    train_pred_ssim = self._compute_ssim(model, train_eval_loader)
-            
             # Assert FLAIR-only inputs/outputs (thesis-defensible)
             if epoch == 0:  # Check once at start
                 sample_batch = next(iter(train_loader))
@@ -321,23 +298,25 @@ class Experiment1(BaseExperiment):
                 assert sample_batch["target"].shape[1] == 1, "This experiment must use FLAIR-only target (C=1)"
                 print("✅ Verified: FLAIR-only inputs (C=1) - WMH used only for slice filtering, not as model input")
             
+            # Validation metrics: evaluate on validation set only
+            with ema.average_parameters():
+                val_recon_psnr, val_pred_psnr = val_epoch(model, val_loader, self.config["DEVICE"])
+                # Calculate SSIM for WMH-structure evaluation
+                val_pred_ssim = self._compute_ssim(model, val_loader)
+            
             # Compute delta PSNR for history
             val_delta_psnr = val_pred_psnr - val_recon_psnr
-            train_delta_psnr = train_pred_psnr - train_recon_psnr
 
+            # Update history: training loss (running average) + validation metrics
             history['train_recon_loss'].append(avg_recon_loss)
             history['train_pred_loss'].append(avg_pred_loss)
-            history['train_recon_psnr'].append(train_recon_psnr)  
-            history['train_pred_psnr'].append(train_pred_psnr)
-            history['train_delta_psnr'].append(train_delta_psnr)
-            history['train_pred_ssim'].append(train_pred_ssim)
             history['val_recon_psnr'].append(val_recon_psnr)
             history['val_pred_psnr'].append(val_pred_psnr)
             history['val_delta_psnr'].append(val_delta_psnr)
             history['val_pred_ssim'].append(val_pred_ssim)
             
             phase = "Warmup" if epoch < warmup_epochs else "ODE Training"
-            print(f"""Epoch {epoch+1} [{phase}]: Train Pred PSNR={train_pred_psnr:.4f}, SSIM={train_pred_ssim:.4f} | Val Pred PSNR={val_pred_psnr:.4f}, SSIM={val_pred_ssim:.4f}""")
+            print(f"""Epoch {epoch+1} [{phase}]: Train Loss={avg_recon_loss:.4f} | Val Pred PSNR={val_pred_psnr:.4f}, SSIM={val_pred_ssim:.4f}""")
             
             # Save best model by SSIM (structure-preserving for WMH)
             if val_pred_ssim > best_val_ssim:
@@ -355,10 +334,6 @@ class Experiment1(BaseExperiment):
             'epoch': range(1, len(history['train_recon_loss']) + 1),
             'train_recon_loss': history['train_recon_loss'],
             'train_pred_loss': history['train_pred_loss'],
-            'train_recon_psnr': history['train_recon_psnr'],
-            'train_pred_psnr': history['train_pred_psnr'],
-            'train_delta_psnr': history['train_delta_psnr'],
-            'train_pred_ssim': history['train_pred_ssim'],
             'val_recon_psnr': history['val_recon_psnr'],
             'val_pred_psnr': history['val_pred_psnr'],
             'val_delta_psnr': history['val_delta_psnr'],
@@ -379,9 +354,9 @@ class Experiment1(BaseExperiment):
         # Create evaluation datasets with proper time deltas
         # Define evaluation tasks with correct time deltas from t1 (Scan1Wave2)
         eval_tasks = {
-            "Scan2Wave3": 1.0,  # t1 -> t2: Δt = 1.0 (Interpolation)
-            "Scan3Wave4": 2.0,  # t1 -> t3: Δt = 2.0 (Training condition)
-            "Scan4Wave5": 3.0   # t1 -> t4: Δt = 3.0 (Extrapolation)
+            "Scan2Wave3": 3.0,  # t1 -> t2: Δt = 3.0 (Interpolation)
+            "Scan3Wave4": 6.0,  # t1 -> t3: Δt = 6.0 (Training condition)
+            "Scan4Wave5": 9.0   # t1 -> t4: Δt = 9.0 (Extrapolation)
         }
         
         # Create datasets with proper source-target pairs and time deltas
@@ -1329,15 +1304,10 @@ class Experiment1(BaseExperiment):
 # ============================================================
 
 if __name__ == "__main__":
-    """
-    Run this experiment directly without going through main.py
-    Usage: python experiments/flair_to_flair.py
-    """
     print("\n" + "="*70)
     print("🧪 Running Experiment 1: FLAIR → FLAIR (Standalone Mode)")
     print("="*70 + "\n")
     
-    # Import config from main.py (reuse the same config)
     from main import CONFIG as MAIN_CONFIG
     CONFIG = MAIN_CONFIG
     
