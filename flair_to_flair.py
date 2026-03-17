@@ -1,29 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Experiment 1: FLAIR → FLAIR with downstream segmentation (only using L1 loss)
+Experiment BL: FLAIR → FLAIR with downstream segmentation
 """
 
-from base import BaseExperiment
+from flair_to_flair_base import BaseFlairToFlairExperiment
 from utils import (
-    FLAIREvolutionDataset,
     LinearWarmupCosineAnnealingLR,
-    neg_cos_sim,
     train_epoch,
     val_epoch,
-    load_folds_from_csv,
-    visualize_results,
     plot_fold_history,
-    evaluate_and_visualize_tasks,
-    analyze_wmh_volume_progression,
     plot_volume_progression,
-    SwinUNetSegmentation,
     segment_3d_volume,
     calculate_volume_ml,
     get_ground_truth_wmh_volume,
+    FLAIREvolutionDataset,
+    SwinUNetSegmentation,
+    load_folds_from_csv,
+    BinaryDice,
 )
 
 import os
-import re
 import torch
 import torch.nn as nn
 import torchmetrics
@@ -36,9 +32,9 @@ from tqdm import tqdm
 from ImageFlowNet.src.nn.imageflownet_ode import ImageFlowNetODE
 
 
-class Experiment1(BaseExperiment):
+class ExperimentBL(BaseFlairToFlairExperiment):
     """
-    Experiment 1: FLAIR → FLAIR prediction with downstream WMH segmentation.
+    Experiment BL: FLAIR → FLAIR prediction with downstream WMH segmentation.
     
     Methodological Design:
     - Uses only L1 loss for FLAIR prediction
@@ -50,65 +46,15 @@ class Experiment1(BaseExperiment):
     - Training metrics: evaluated on full training set (not sampled)
     """
     
-    def __init__(self, experiment_number, experiment_config, config):
-        """
-        Initialize Experiment 1.
-        
-        Args:
-            experiment_number: The experiment number
-            experiment_config: Dictionary with experiment configuration
-            config: Global configuration dictionary
-        """
-        super().__init__(experiment_number, experiment_config)
-        self.config = config
-
-        # print("self.config['TEST_CSV']:", self.config["TEST_CSV"])
-        # print("self.config['TEST_CSV', None]:", self.config["TEST_CSV", None])
-
-        # No held-out test CSV for full 4-fold CV (test is one of the folds).
-        self.test_patient_ids = None
-    
-    def _load_patient_ids(self, csv_path, column="patient_ID"):
-        df = pd.read_csv(csv_path)
-        if column not in df.columns:
-            raise ValueError(f"Column '{column}' not found in {csv_path}. Columns: {list(df.columns)}")
-        pids = []
-        for x in df[column].astype(str).tolist():
-            pid = str(x).strip()
-            pid = re.sub(r"^LBC36", "", pid)
-            pid = re.sub(r"^LBC", "", pid)
-            pid = re.sub(r"[^\d]", "", pid)
-            pid = pid.zfill(4)
-            pids.append(pid)
-        return pids
-    
-    def _compute_ssim(self, model, loader):
-        """
-        Compute SSIM for prediction task (structure-preserving metric for WMH).
-        
-        Args:
-            model: The model to evaluate
-            loader: DataLoader for evaluation
-            
-        Returns:
-            Average SSIM score
-        """
-        model.eval()
-        ssim_metric = torchmetrics.StructuralSimilarityIndexMeasure(data_range=1.0).to(self.config["DEVICE"])
-        
-        with torch.no_grad():
-            for batch in loader:
-                source_img = batch["source"].to(self.config["DEVICE"])
-                target_img = batch["target"].to(self.config["DEVICE"])
-                time_deltas = batch["time_delta"].to(self.config["DEVICE"])
-                
-                # Predict target from source
-                t = time_deltas[0:1]
-                predicted_target = model(source_img, t)
-                
-                ssim_metric.update(predicted_target, target_img)
-        
-        return ssim_metric.compute().item()
+    require_wmh_presence = False
+    use_wmh_for_stage1_dataset = False
+    stage1_max_slices_per_patient = 12
+    stage1_dataset_kwargs = {
+        "slice_selection_mode": "random_valid",
+        "valid_slice_mode": "wmh",
+        "random_seed": 42,
+    }
+    run_title = "FLAIR → FLAIR (L1 only)"
     
     # def _diagnose_wmh(self, dataset):
     #     print("\n================ WMH DIAGNOSTIC ================")
@@ -148,9 +94,9 @@ class Experiment1(BaseExperiment):
     #         print("=================================================\n")
     
     def run(self):
-        """Execute the full Experiment 1 pipeline."""
+        """Execute the full Experiment BL pipeline."""
         print("\n" + "="*60)
-        print("Starting Experiment 1: FLAIR → FLAIR (L1 only)")
+        print("Starting Experiment BL: FLAIR → FLAIR")
         print("="*60 + "\n")
         
         # Stage 1: Train ImageFlowNet models
@@ -168,32 +114,9 @@ class Experiment1(BaseExperiment):
         print("✅ STAGE 1: ImageFlowNet Training")
         print("="*60)
         
-        # Define training pairs: t1 -> t3 only
-        # Scan1Wave2 (t1) -> Scan3Wave4 (t3) with time_delta = 2.0
-        training_pairs = [
-            ("Scan1Wave2", "Scan3Wave4", 6.0)  # Train on t1 -> t3
-        ]
-        
-        # Initialize dataset with custom training pairs
-        print("Initializing dataset with custom training pairs (t1->t3)...")
-        # Experiment 1 trains a FLAIR-only model (C=1) but uses WMH masks for slice filtering.
-        # So: `use_wmh=False` (do not add WMH channel to tensors), and keep `require_wmh_presence=True`.
-        full_dataset = FLAIREvolutionDataset(
-            root_dir=self.config["ROOT_DIR"],
-            max_slices_per_patient=self.config["MAX_SLICES"],
-            use_wmh=False,
-            require_wmh_presence=True,
-            training_pairs=training_pairs  # Only train on t1->t3
-        )
-
-        # self._diagnose_wmh(full_dataset)
-        
-        # Load fold assignments
-        fold_csv = self.config["FOLD_CSV"]
-        if not os.path.exists(fold_csv):
-            raise FileNotFoundError(f"Fold CSV not found at {fold_csv}")
-        folds_dict = load_folds_from_csv(fold_csv)
-        print(f"Loaded patient folds from {fold_csv}")
+        print("Initializing dataset with custom training pairs (all temporal pairs)...")
+        full_dataset = self._create_stage1_dataset()
+        folds_dict = self._load_folds_dict()
         
         # Full 4-fold CV with train/val/test = 2/1/1 folds
         print(f"\n📈 Starting {self.config['K_FOLDS']}-Fold Cross-Validation Training (2 train / 1 val / 1 test)...")
@@ -260,7 +183,10 @@ class Experiment1(BaseExperiment):
             max_epochs=self.config["NUM_EPOCHS"]
         )
         ema = ExponentialMovingAverage(model.parameters(), decay=0.9)
-        recon_loss = nn.L1Loss()
+        recon_loss = nn.MSELoss()
+        max_time_delta = max(time_delta for _, _, time_delta in self.training_pairs)
+        t_multiplier = self.config.get("ODE_MAX_T", max_time_delta) / max_time_delta
+        self.config["T_MULTIPLIER"] = t_multiplier
         
         # Two-phase training: warmup with reconstruction, then full ODE training
         warmup_epochs = self.config.get("WARMUP_EPOCHS", self.config["NUM_EPOCHS"] // 10)
@@ -269,10 +195,13 @@ class Experiment1(BaseExperiment):
         best_val_ssim = 0.0
         model_save_path = self.get_model_path(test_fold_idx)
         
-        # History: track training loss (running average) and validation metrics
         history = {
             'train_recon_loss': [],
             'train_pred_loss': [],
+            'train_recon_psnr': [],   
+            'train_pred_psnr': [],    
+            'train_delta_psnr': [],
+            'train_pred_ssim': [],
             'val_recon_psnr': [],
             'val_pred_psnr': [],
             'val_delta_psnr': [],
@@ -288,8 +217,38 @@ class Experiment1(BaseExperiment):
             avg_recon_loss, avg_pred_loss = train_epoch(
                 model, train_loader, optimizer, ema, recon_loss,
                 self.config["DEVICE"], epoch, use_ode_training,
-                self.config["NUM_EPOCHS"], self.config["CONTRASTIVE_COEFF"]
+                self.config["NUM_EPOCHS"], self.config["CONTRASTIVE_COEFF"],
+                smoothness_coeff=self.config.get("SMOOTHNESS_COEFF", 0.0),
+                latent_coeff=self.config.get("LATENT_COEFF", 0.0),
+                invariance_coeff=self.config.get("INVARIANCE_COEFF", 0.0),
+                no_l2=self.config.get("NO_L2", False),
+                t_multiplier=t_multiplier,
+                noise_max_intensity=self.config.get("NOISE_MAX_INTENSITY", 0.1),
             )
+            
+            # Validation metrics
+            with ema.average_parameters():
+                val_recon_psnr, val_pred_psnr = val_epoch(
+                    model, val_loader, self.config["DEVICE"], t_multiplier=t_multiplier
+                )
+                # Calculate SSIM for WMH-structure evaluation
+                val_pred_ssim = self._compute_ssim(model, val_loader)
+            
+            # Training metrics: evaluate on FULL training set (not sampled)
+            # Evaluate every N epochs to save time
+            train_eval_frequency = self.config.get("TRAIN_EVAL_EVERY", 5)
+            if (epoch + 1) % train_eval_frequency == 0 or epoch == 0:
+                with torch.no_grad(), ema.average_parameters():
+                    train_eval_loader = DataLoader(
+                        Subset(full_dataset, train_indices),
+                        batch_size=self.config["BATCH_SIZE"],
+                        shuffle=False,
+                        num_workers=0
+                    )
+                    train_recon_psnr, train_pred_psnr = val_epoch(
+                        model, train_eval_loader, self.config["DEVICE"], t_multiplier=t_multiplier
+                    )
+                    train_pred_ssim = self._compute_ssim(model, train_eval_loader)
             
             # Assert FLAIR-only inputs/outputs (thesis-defensible)
             if epoch == 0:  # Check once at start
@@ -298,25 +257,23 @@ class Experiment1(BaseExperiment):
                 assert sample_batch["target"].shape[1] == 1, "This experiment must use FLAIR-only target (C=1)"
                 print("✅ Verified: FLAIR-only inputs (C=1) - WMH used only for slice filtering, not as model input")
             
-            # Validation metrics: evaluate on validation set only
-            with ema.average_parameters():
-                val_recon_psnr, val_pred_psnr = val_epoch(model, val_loader, self.config["DEVICE"])
-                # Calculate SSIM for WMH-structure evaluation
-                val_pred_ssim = self._compute_ssim(model, val_loader)
-            
             # Compute delta PSNR for history
             val_delta_psnr = val_pred_psnr - val_recon_psnr
+            train_delta_psnr = train_pred_psnr - train_recon_psnr
 
-            # Update history: training loss (running average) + validation metrics
             history['train_recon_loss'].append(avg_recon_loss)
             history['train_pred_loss'].append(avg_pred_loss)
+            history['train_recon_psnr'].append(train_recon_psnr)  
+            history['train_pred_psnr'].append(train_pred_psnr)
+            history['train_delta_psnr'].append(train_delta_psnr)
+            history['train_pred_ssim'].append(train_pred_ssim)
             history['val_recon_psnr'].append(val_recon_psnr)
             history['val_pred_psnr'].append(val_pred_psnr)
             history['val_delta_psnr'].append(val_delta_psnr)
             history['val_pred_ssim'].append(val_pred_ssim)
             
             phase = "Warmup" if epoch < warmup_epochs else "ODE Training"
-            print(f"""Epoch {epoch+1} [{phase}]: Train Loss={avg_recon_loss:.4f} | Val Pred PSNR={val_pred_psnr:.4f}, SSIM={val_pred_ssim:.4f}""")
+            print(f"""Epoch {epoch+1} [{phase}]: Train Pred PSNR={train_pred_psnr:.4f}, SSIM={train_pred_ssim:.4f} | Val Pred PSNR={val_pred_psnr:.4f}, SSIM={val_pred_ssim:.4f}""")
             
             # Save best model by SSIM (structure-preserving for WMH)
             if val_pred_ssim > best_val_ssim:
@@ -334,6 +291,10 @@ class Experiment1(BaseExperiment):
             'epoch': range(1, len(history['train_recon_loss']) + 1),
             'train_recon_loss': history['train_recon_loss'],
             'train_pred_loss': history['train_pred_loss'],
+            'train_recon_psnr': history['train_recon_psnr'],
+            'train_pred_psnr': history['train_pred_psnr'],
+            'train_delta_psnr': history['train_delta_psnr'],
+            'train_pred_ssim': history['train_pred_ssim'],
             'val_recon_psnr': history['val_recon_psnr'],
             'val_pred_psnr': history['val_pred_psnr'],
             'val_delta_psnr': history['val_delta_psnr'],
@@ -344,153 +305,65 @@ class Experiment1(BaseExperiment):
         print(f"📊 Training history saved to {history_csv_path}")
     
     def _evaluate_on_test_set(self, full_dataset, folds_dict, val_offset=1):
-        """Evaluate each fold's model on its designated test split (no held-out CSV)."""
-        print("\n" + "="*60)
-        print("✅ CV Training Complete. Starting Final Evaluation on Per-Fold Test Splits.")
-        print("="*60)
+        """Evaluate ensemble predictions on each fold's held-out test patients."""
+        print("\n" + "=" * 60)
+        print("Ensemble evaluation on per-fold test splits")
+        print("=" * 60)
 
-        cv_folds = list(self.config["CV_FOLDS"])
-        
-        # Create evaluation datasets with proper time deltas
-        # Define evaluation tasks with correct time deltas from t1 (Scan1Wave2)
-        eval_tasks = {
-            "Scan2Wave3": 3.0,  # t1 -> t2: Δt = 3.0 (Interpolation)
-            "Scan3Wave4": 6.0,  # t1 -> t3: Δt = 6.0 (Training condition)
-            "Scan4Wave5": 9.0   # t1 -> t4: Δt = 9.0 (Extrapolation)
-        }
-        
-        # Create datasets with proper source-target pairs and time deltas
-        eval_datasets = {}
-        for target_scan, time_delta in eval_tasks.items():
-            eval_datasets[target_scan] = FLAIREvolutionDataset(
-                root_dir=self.config["ROOT_DIR"],
-                max_slices_per_patient=self.config["MAX_SLICES"],
-                use_wmh=False,
-                require_wmh_presence=True,
-                training_pairs=[("Scan1Wave2", target_scan, time_delta)]  # Proper pairs with time_delta
-            )
-        
-        # Create source loader and ground truth loaders for evaluation
-        # Source is just the first batch of Scan1Wave2 data (we need it for structure)
-        original_scans_dir = os.path.join(self.config["ROOT_DIR"], "Scan1Wave2_FLAIR_brain")
+        all_stage1_model_paths = [
+            self.get_model_path(fold_idx)
+            for fold_idx in self.config["CV_FOLDS"]
+            if os.path.exists(self.get_model_path(fold_idx))
+        ]
+        if not all_stage1_model_paths:
+            print("No trained Stage 1 models found to evaluate.")
+            return None, None
+
+        _, loaded_segmentors = self._load_fold_specific_segmentors()
+        source_dataset, target_datasets = self._create_ensemble_eval_datasets()
 
         all_results = []
-        for test_fold in cv_folds:
-            val_fold = cv_folds[(cv_folds.index(test_fold) + int(val_offset)) % len(cv_folds)]
+        for test_fold in self.config["CV_FOLDS"]:
             test_pids = set(folds_dict[test_fold])
+            eligible_model_paths = self._get_leakage_free_ensemble_model_paths(test_fold)
+            if not eligible_model_paths:
+                print(f"⚠️ No leakage-free ensemble members available for test fold {test_fold}. Skipping.")
+                continue
 
-            # Build loaders for this test split.
-            source_dataset = eval_datasets["Scan2Wave3"]  # any dataset works for source
-            source_test_indices = [i for i, item in enumerate(source_dataset.index_map)
-                                   if item['patient_id'] in test_pids]
+            eligible_model_names = [os.path.basename(path) for path in eligible_model_paths]
+            print(
+                f"Test fold {test_fold}: using {len(eligible_model_paths)} leakage-free ensemble member(s): "
+                f"{eligible_model_names}"
+            )
+
+            source_test_indices = [
+                i for i, item in enumerate(source_dataset.index_map)
+                if item["patient_id"] in test_pids
+            ]
             source_loader = DataLoader(
                 Subset(source_dataset, source_test_indices),
                 batch_size=self.config["BATCH_SIZE"],
-                shuffle=False
+                shuffle=False,
+                num_workers=0,
             )
 
-            gt_loaders = {}
-            for scan_name, dataset in eval_datasets.items():
-                test_indices = [i for i, item in enumerate(dataset.index_map)
-                               if item['patient_id'] in test_pids]
-                gt_loaders[scan_name] = DataLoader(
-                    Subset(dataset, test_indices),
-                    batch_size=self.config["BATCH_SIZE"],
-                    shuffle=False
-                )
-
-            model_path = self.get_model_path(test_fold)
-            if not os.path.exists(model_path):
-                print(f"⚠️ Model for test fold {test_fold} not found: {model_path}")
-                continue
-
-            result = evaluate_and_visualize_tasks(
-                model_path, source_loader, gt_loaders,
-                self.config["DEVICE"],
-                original_scans_dir,
-                in_channels=1,  # FLAIR only
-                out_channels=1,
-                results_dir=self.results_dir
+            output_prefix = f"ensemble_test_fold_{test_fold}"
+            fold_result, patient_predictions = self._evaluate_ensemble_with_segmentation(
+                model_paths=eligible_model_paths,
+                source_loader=source_loader,
+                target_datasets=target_datasets,
+                segmentor_model=loaded_segmentors[test_fold],
+                output_prefix=output_prefix,
             )
-            result["fold"] = test_fold
-            result["val_fold"] = val_fold
-            all_results.append(result)
+            fold_result["fold"] = test_fold
+            all_results.append(fold_result)
 
         if not all_results:
-            print("No trained models found to evaluate.")
             return None, None
-        
-        # Report results
-        print("\n" + "="*60)
-        print("============= Final Test Set Results (Mean +/- Std Dev) =============")
-        print("="*60)
-        
-        interp_psnrs = [r['Interpolation_t2']['PSNR'] for r in all_results]
-        train_psnrs = [r['Training_t3']['PSNR'] for r in all_results]
-        extrap_psnrs = [r['Extrapolation_t4']['PSNR'] for r in all_results]
-        
-        print(f"Interpolation PSNR (t1->t2, Δt=1.0): {np.mean(interp_psnrs):.4f} +/- {np.std(interp_psnrs):.4f}")
-        print(f"Training PSNR      (t1->t3, Δt=2.0): {np.mean(train_psnrs):.4f} +/- {np.std(train_psnrs):.4f}")
-        print(f"Extrapolation PSNR (t1->t4, Δt=3.0): {np.mean(extrap_psnrs):.4f} +/- {np.std(extrap_psnrs):.4f}")
-        print("="*60)
-        
-        # Save test set evaluation results to CSV
-        test_results_data = []
-        for result in all_results:
-            fold_idx = result.get("fold", None)
-            test_results_data.append({
-                'fold': fold_idx,
-                'model_path': os.path.basename(result['model_path']),
-                'interpolation_t2_psnr': result['Interpolation_t2']['PSNR'],
-                'interpolation_t2_ssim': result['Interpolation_t2']['SSIM'],
-                'training_t3_psnr': result['Training_t3']['PSNR'],
-                'training_t3_ssim': result['Training_t3']['SSIM'],
-                'extrapolation_t4_psnr': result['Extrapolation_t4']['PSNR'],
-                'extrapolation_t4_ssim': result['Extrapolation_t4']['SSIM']
-            })
-        
-        test_results_df = pd.DataFrame(test_results_data)
-        
-        # Add summary statistics
-        summary_row = {
-            'fold': 'mean',
-            'model_path': 'N/A',
-            'interpolation_t2_psnr': np.mean(interp_psnrs),
-            'interpolation_t2_ssim': np.mean([r['Interpolation_t2']['SSIM'] for r in all_results]),
-            'training_t3_psnr': np.mean(train_psnrs),
-            'training_t3_ssim': np.mean([r['Training_t3']['SSIM'] for r in all_results]),
-            'extrapolation_t4_psnr': np.mean(extrap_psnrs),
-            'extrapolation_t4_ssim': np.mean([r['Extrapolation_t4']['SSIM'] for r in all_results])
-        }
-        std_row = {
-            'fold': 'std',
-            'model_path': 'N/A',
-            'interpolation_t2_psnr': np.std(interp_psnrs),
-            'interpolation_t2_ssim': np.std([r['Interpolation_t2']['SSIM'] for r in all_results]),
-            'training_t3_psnr': np.std(train_psnrs),
-            'training_t3_ssim': np.std([r['Training_t3']['SSIM'] for r in all_results]),
-            'extrapolation_t4_psnr': np.std(extrap_psnrs),
-            'extrapolation_t4_ssim': np.std([r['Extrapolation_t4']['SSIM'] for r in all_results])
-        }
-        
-        test_results_df = pd.concat([test_results_df, pd.DataFrame([summary_row, std_row])], ignore_index=True)
-        
-        test_results_csv_path = os.path.join(self.results_dir, "test_set_evaluation_results.csv")
-        test_results_df.to_csv(test_results_csv_path, index=False)
-        print(f"📊 Test set evaluation results saved to {test_results_csv_path}\n")
-        
-        best_result = max(all_results, key=lambda x: x['Training_t3']['PSNR'])
-        best_model_name = os.path.basename(best_result['model_path']).split('.')[0]
-        print(f"🏆 Best model: {best_model_name} (Training PSNR: {max(train_psnrs):.4f})")
-        
-        predicted_flair_dir = os.path.join(self.results_dir, f"{best_model_name}_Pred_Scan3Wave4")
+
+        self._report_test_results(all_results)
         ground_truth_wmh_dir = os.path.join(self.config["ROOT_DIR"], "Scan3Wave4_WMH")
-        
-        print(f"\n{'='*60}")
-        print(f"✅ Stage 1 Complete - ImageFlowNet Training and Evaluation")
-        print(f"{'='*60}")
-                
-        return predicted_flair_dir, ground_truth_wmh_dir
+        return self.results_dir, ground_truth_wmh_dir
     
     def _create_gt_lookup(self, gt_datasets):
         """Create a lookup dictionary for efficient ground truth retrieval."""
@@ -502,428 +375,240 @@ class Experiment1(BaseExperiment):
                 s_idx = item['slice_idx']
                 gt_lookup[scan_name][(p_id, s_idx)] = idx
         return gt_lookup
-    
-    def _evaluate_model_with_segmentation(self, model_path, source_loader, gt_loaders, 
-                                         target_datasets, segmentor_model):
-        """
-        Evaluate a single FLAIR prediction model with downstream segmentation.
-        
-        Two-stage evaluation:
-        1. Predict FLAIR using ImageFlowNetODE
-        2. Apply trained segmentor to predicted FLAIR for WMH prediction
-        
-        Args:
-            model_path: Path to trained ImageFlowNetODE model
-            source_loader: DataLoader for source (t1) images
-            gt_loaders: Dictionary of ground truth DataLoaders
-            target_datasets: Dictionary of target datasets
-            segmentor_model: Pre-trained segmentation model
-            
-        Returns:
-            results_dict: Dictionary with metrics for each task
-            patient_predictions: Dictionary with predictions by patient/slice
-        """
-        print(f"\n--- Evaluating: {os.path.basename(model_path)} ---")
-        
-        # Load FLAIR prediction model (ImageFlowNetODE - single channel)
-        model = ImageFlowNetODE(
-            device=self.config["DEVICE"],
-            in_channels=1,  # FLAIR only
-            ode_location='bottleneck',
-            contrastive=True
-        ).to(self.config["DEVICE"])
-        model.load_state_dict(torch.load(model_path, map_location=self.config["DEVICE"]))
-        model.eval()
-        
-        # Segmentor is already loaded and on device
-        segmentor_model.eval()
-        
-        # Define evaluation tasks
-        tasks = {
-            "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": 1.0},
-            "Training_t3": {"scan_pair": "Scan3Wave4", "time": 2.0},
-            "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": 3.0},
-        }
-        
-        # Initialize metrics
-        from utils import BinaryDice
-        metrics = {name: {
-            "psnr_flair": torchmetrics.PeakSignalNoiseRatio(data_range=1.0).to(self.config["DEVICE"]),
-            "ssim_flair": torchmetrics.StructuralSimilarityIndexMeasure(data_range=1.0).to(self.config["DEVICE"]),
-            "dice_wmh": BinaryDice(threshold=0.5).to(self.config["DEVICE"]),
-        } for name in tasks}
-        
-        gt_lookup = self._create_gt_lookup(target_datasets)
-        
-        # Collect predictions for saving
-        patient_predictions = {task_name: {} for task_name in tasks}
-        
-        with torch.no_grad():
-            for i, source_batch in enumerate(tqdm(source_loader, desc="Evaluating")):
-                source_flair = source_batch["source"].to(self.config["DEVICE"])
-                patient_ids, slice_indices = source_batch["patient_id"], source_batch["slice_idx"]
-                
-                for task_name, task_info in tasks.items():
-                    try:
-                        # --- Stage 1: FLAIR Prediction ---
-                        t = torch.tensor([task_info["time"]], device=self.config["DEVICE"])
-                        pred_flair = model(source_flair, t=t)
-                        pred_flair = torch.sigmoid(pred_flair)
-                        
-                        # --- Stage 2: WMH Segmentation from Predicted FLAIR ---
-                        # Apply per-sample min-max normalization (consistent with training)
-                        batch_size = pred_flair.shape[0]
-                        pred_flair_normalized = torch.zeros_like(pred_flair)
-                        for i in range(batch_size):
-                            sample = pred_flair[i]
-                            min_val = sample.min()
-                            max_val = sample.max()
-                            if max_val > min_val:
-                                pred_flair_normalized[i] = (sample - min_val) / (max_val - min_val)
-                            else:
-                                pred_flair_normalized[i] = sample
-                        pred_flair_normalized = torch.clamp(pred_flair_normalized, 0.0, 1.0)
-                        
-                        # NOTE: SwinUNetSegmentation returns logits, so we apply sigmoid to get probabilities
-                        pred_wmh_logits = segmentor_model(pred_flair_normalized)
-                        pred_wmh_prob = torch.sigmoid(pred_wmh_logits)
-                        
-                        gt_pair_name = task_info["scan_pair"]
-                        gt_dataset = target_datasets[gt_pair_name]
-                        
-                        # --- Gather Matched Ground Truth ---
-                        target_flair_valid = []
-                        target_wmh_valid = []
-                        pred_flair_valid = []
-                        pred_wmh_prob_valid = []
-                        
-                        for j in range(len(patient_ids)):
-                            p_id = patient_ids[j]
-                            if isinstance(p_id, torch.Tensor):
-                                p_id_str = str(p_id.item()).zfill(4)
-                            else:
-                                p_id_str = str(p_id).zfill(4)
-                            s_idx = slice_indices[j].item()
-                            
-                            # Find matching ground truth
-                            gt_idx = gt_lookup[gt_pair_name].get((p_id_str, s_idx))
-                            
-                            if gt_idx is not None:
-                                gt_sample = gt_dataset[gt_idx]
-                                tgt = gt_sample["target"].to(self.config["DEVICE"])
-                                
-                                # Extract FLAIR and WMH from ground truth
-                                target_flair_valid.append(tgt[0:1, :, :])
-                                # Handle case where WMH might not be present
-                                if tgt.shape[0] > 1:
-                                    target_wmh_valid.append(tgt[1:2, :, :].int())
-                                else:
-                                    target_wmh_valid.append(torch.zeros_like(tgt[0:1, :, :]).int())
-                                
-                                pred_flair_valid.append(pred_flair[j, 0:1, :, :])
-                                pred_wmh_prob_valid.append(pred_wmh_prob[j, 0:1, :, :])
-                                
-                                # Store predictions for 3D reconstruction
-                                if p_id_str not in patient_predictions[task_name]:
-                                    patient_predictions[task_name][p_id_str] = {}
-                                patient_predictions[task_name][p_id_str][s_idx] = {
-                                    'flair': pred_flair[j, 0].cpu().numpy(),
-                                    'wmh': pred_wmh_prob[j, 0].cpu().numpy()
-                                }
-                        
-                        # --- Apply Robust Metric Filtering and Update ---
-                        if len(target_flair_valid) > 0:
-                            target_flair_batch = torch.stack(target_flair_valid)
-                            pred_flair_batch = torch.stack(pred_flair_valid)
-                            target_wmh_batch = torch.stack(target_wmh_valid)
-                            pred_wmh_prob_batch = torch.stack(pred_wmh_prob_valid)
-                            
-                            # Non-uniformity filter
-                            STD_THR = 5e-4
-                            std_filter = torch.std(target_flair_batch.float().flatten(start_dim=1), dim=1) > STD_THR
-                            
-                            # Non-perfect match filter
-                            MSE_THR = 1e-10
-                            mse_per_slice = torch.mean((pred_flair_batch - target_flair_batch)**2, dim=(1, 2, 3))
-                            mse_filter = mse_per_slice > MSE_THR
-                            
-                            # Combined robust filter
-                            robust_filter = std_filter & mse_filter
-                            
-                            if robust_filter.any():
-                                filtered_pred_flair = pred_flair_batch[robust_filter]
-                                filtered_target_flair = target_flair_batch[robust_filter]
-                                
-                                metrics[task_name]["psnr_flair"].update(filtered_pred_flair, filtered_target_flair)
-                                metrics[task_name]["ssim_flair"].update(filtered_pred_flair, filtered_target_flair)
-                            
-                            # Dice metric (always safe)
-                            metrics[task_name]["dice_wmh"].update(pred_wmh_prob_batch, target_wmh_batch)
-                            
-                            # Visualization (first batch only)
-                            if i == 0:
-                                target_flair_vis = torch.zeros_like(source_flair)
-                                target_wmh_vis = torch.zeros_like(source_flair[:, 0:1, :, :]).int()
-                                for j in range(min(len(target_flair_valid), source_flair.shape[0])):
-                                    target_flair_vis[j] = target_flair_valid[j]
-                                    target_wmh_vis[j] = target_wmh_valid[j]
-                                
-                                self._visualize_predictions(
-                                    source_flair, target_flair_vis, target_wmh_vis,
-                                    pred_flair, pred_wmh_prob,
-                                    patient_ids, slice_indices,
-                                    model_path, task_name
-                                )
-                    except StopIteration:
-                        continue
-        
-        # --- Final Metric Aggregation ---
-        final_results = {'model_path': model_path}
-        for task_name in tasks:
-            psnr_val = metrics[task_name]["psnr_flair"].compute().item()
-            ssim_val = metrics[task_name]["ssim_flair"].compute().item()
-            dice_val = metrics[task_name]["dice_wmh"].compute().item()
-            
-            # Handle unstable values
-            if np.isinf(psnr_val) or np.isnan(psnr_val):
-                psnr_val = np.nan
-                print(f"⚠️ Warning: PSNR for {task_name} was unstable. Set to NaN.")
-            
-            if np.isinf(ssim_val) or np.isnan(ssim_val):
-                ssim_val = np.nan
-                print(f"⚠️ Warning: SSIM for {task_name} was unstable. Set to NaN.")
-            
-            final_results[task_name] = {
-                "PSNR": psnr_val,
-                "SSIM": ssim_val,
-                "Dice": dice_val,
-            }
-        
-        # Save 3D predictions
-        self._save_3d_predictions(patient_predictions, tasks, model_path)
-        
-        return final_results, patient_predictions
-    
-    def _visualize_predictions(self, source_flair, target_flair, target_wmh,
-                               pred_flair, pred_wmh, patient_ids, slice_indices,
-                               model_path, task_name):
-        """Visualize predictions for a batch, prioritizing slices with highest WMH volume."""
-        import matplotlib.pyplot as plt
-        
-        model_prefix = os.path.basename(model_path).split('.')[0]
-        save_path = os.path.join(self.results_dir, f"{model_prefix}_{task_name}_max_wmh_sample.png")
-        
-        # Sort batch by WMH volume
-        wmh_counts = target_wmh.sum(dim=(1, 2, 3)).cpu().numpy()
-        sorted_indices = np.argsort(wmh_counts)[::-1]
-        
-        n_samples = min(4, source_flair.shape[0])
-        fig, axes = plt.subplots(n_samples, 5, figsize=(20, n_samples * 4))
-        
-        if n_samples == 1:
-            axes = axes.reshape(1, -1)
-        
-        for i in range(n_samples):
-            idx = sorted_indices[i]
-            
-            p_id = patient_ids[idx]
-            s_idx = slice_indices[idx].item()
-            vol_ml = wmh_counts[idx]
-            
-            # Column 1: Source FLAIR
-            axes[i, 0].imshow(source_flair[idx, 0].cpu().numpy(), cmap='gray')
-            axes[i, 0].set_title(f"Source FLAIR\nID: {p_id}, Slc: {s_idx}")
-            axes[i, 0].axis('off')
-            
-            # Column 2: Ground Truth FLAIR
-            axes[i, 1].imshow(target_flair[idx, 0].cpu().numpy(), cmap='gray')
-            axes[i, 1].set_title("GT FLAIR")
-            axes[i, 1].axis('off')
-            
-            # Column 3: Predicted FLAIR
-            axes[i, 2].imshow(pred_flair[idx, 0].cpu().numpy(), cmap='gray')
-            axes[i, 2].set_title("Predicted FLAIR")
-            axes[i, 2].axis('off')
-            
-            # Column 4: Ground Truth WMH
-            axes[i, 3].imshow(target_wmh[idx, 0].cpu().numpy(), cmap='hot')
-            axes[i, 3].set_title(f"GT WMH (Pixels: {vol_ml:.0f})")
-            axes[i, 3].axis('off')
-            
-            # Column 5: Predicted WMH
-            axes[i, 4].imshow(pred_wmh[idx, 0].cpu().numpy(), cmap='hot')
-            axes[i, 4].set_title("Predicted WMH")
-            axes[i, 4].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"📷 Max-WMH visualization saved: {save_path}")
-    
-    def _save_3d_predictions(self, patient_predictions, tasks, model_path):
-        """Save 3D FLAIR and WMH predictions as NIfTI files."""
-        import nibabel as nib
-        
-        model_prefix = os.path.basename(model_path).split('.')[0]
-        original_scans_dir = os.path.join(self.config["ROOT_DIR"], "Scan1Wave2_FLAIR_brain")
-        
-        for task_name, task_info in tasks.items():
-            predictions_by_patient = patient_predictions[task_name]
-            gt_pair_name = task_info["scan_pair"]
-            
-            # Create directories
-            flair_save_dir = os.path.join(self.results_dir, f"{model_prefix}_Pred_{gt_pair_name}_FLAIR_3D")
-            wmh_save_dir = os.path.join(self.results_dir, f"{model_prefix}_Pred_{gt_pair_name}_WMH_3D")
-            os.makedirs(flair_save_dir, exist_ok=True)
-            os.makedirs(wmh_save_dir, exist_ok=True)
-            
-            print(f"\n--- Saving predictions for Task: {task_name} ---")
-            
-            saved_pids = []
-            
-            for patient_id, slices in predictions_by_patient.items():
-                if not slices:
-                    print(f"    ⚠️ SKIPPED patient {patient_id}: No predicted slices found.")
-                    continue
-                
-                max_slice_idx = max(slices.keys())
-                H, W = next(iter(slices.values()))['flair'].shape
-                flair_volume = np.zeros((H, W, max_slice_idx + 1), dtype=np.float32)
-                wmh_volume = np.zeros((H, W, max_slice_idx + 1), dtype=np.float32)
-                
-                for slice_idx, pred_data in slices.items():
-                    flair_volume[:, :, slice_idx] = pred_data['flair']
-                    wmh_volume[:, :, slice_idx] = pred_data['wmh']
-                
-                # Get affine from original scan
-                affine = np.eye(4)
-                try:
-                    padded_patient_id = patient_id.zfill(4)
-                    full_prefix = f"LBC36{padded_patient_id}"
-                    original_file = next(f for f in os.listdir(original_scans_dir) if f.startswith(full_prefix))
-                    original_nii = nib.load(os.path.join(original_scans_dir, original_file))
-                    affine = original_nii.affine
-                except Exception as e:
-                    print(f"    ⚠️ Warning: Could not find original NIfTI for patient {patient_id}. Using identity affine.")
-                
-                # Save FLAIR
-                flair_nii = nib.Nifti1Image(flair_volume, affine)
-                flair_path = os.path.join(flair_save_dir, f"{patient_id}_predicted_flair_3D.nii.gz")
-                nib.save(flair_nii, flair_path)
-                
-                # Save WMH
-                wmh_nii = nib.Nifti1Image(wmh_volume, affine)
-                wmh_path = os.path.join(wmh_save_dir, f"{patient_id}_predicted_wmh_3D.nii.gz")
-                nib.save(wmh_nii, wmh_path)
-                
-                saved_pids.append(patient_id)
-            
-            print(f"--- Saved Patient IDs for {task_name}: {', '.join(saved_pids)}")
-            print(f"💾 Saved 3D predictions for {task_name} in {flair_save_dir} and {wmh_save_dir}")
-    
-    def _visualize_top_wmh_across_test_set(self, patient_predictions, tasks, top_n=10):
-        """
-        Plots top N slices with highest WMH volume in 4-column comparison format:
-        GT FLAIR, Pred FLAIR, GT WMH, Pred WMH.
-        Includes slice-wise Dice score.
-        
-        Args:
-            patient_predictions: Dictionary with predictions by task/patient/slice
-            tasks: Dictionary of task definitions
-            top_n: Number of top WMH slices to visualize
-        """
-        import matplotlib.pyplot as plt
-        
-        all_slices = []
-        
-        # Recreate target datasets for ground truth lookup
+
+    def _load_fold_specific_segmentors(self):
+        """Load pretrained fold-specific WMH segmentors."""
+        swinunetr_models_dir = self.config.get("SWINUNETR_MODELS_DIR", "swinunetr_models")
+        if not os.path.exists(swinunetr_models_dir):
+            raise FileNotFoundError(
+                f"Pretrained SwinUNETR models directory not found: {swinunetr_models_dir}"
+            )
+
+        fold_to_model = {}
+        loaded_models = {}
+        cv_folds = list(self.config["CV_FOLDS"])
+        val_offset = int(self.config.get("VAL_OFFSET", 1))
+
+        for test_fold in cv_folds:
+            val_fold = cv_folds[(cv_folds.index(test_fold) + val_offset) % len(cv_folds)]
+            model_filename = f"wmh_swinunetr_test{test_fold}_val{val_fold}.pth"
+            model_path = os.path.join(swinunetr_models_dir, model_filename)
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Missing pretrained segmentation model: {model_path}")
+
+            model = SwinUNetSegmentation().to(self.config["DEVICE"])
+            model.load_state_dict(torch.load(model_path, map_location=self.config["DEVICE"]))
+            model.eval()
+            fold_to_model[test_fold] = model_path
+            loaded_models[test_fold] = model
+
+        return fold_to_model, loaded_models
+
+    def _create_ensemble_eval_datasets(self):
+        """Create source and target datasets for fold-wise ensemble evaluation."""
+        source_dataset = FLAIREvolutionDataset(
+            root_dir=self.config["ROOT_DIR"],
+            max_slices_per_patient=self.config["MAX_SLICES"],
+            use_wmh=False,
+            training_pairs=[("Scan1Wave2", "Scan1Wave2", 0.0)],
+            require_wmh_presence=False,
+        )
+
         target_datasets = {}
-        for task_name, task_info in tasks.items():
-            target_scan = task_info["scan_pair"]
+        for target_scan in ["Scan2Wave3", "Scan3Wave4", "Scan4Wave5"]:
             target_datasets[target_scan] = FLAIREvolutionDataset(
                 root_dir=self.config["ROOT_DIR"],
                 max_slices_per_patient=self.config["MAX_SLICES"],
                 use_wmh=True,
                 training_pairs=[(target_scan, target_scan, 0.0)],
-                require_wmh_presence=False
+                require_wmh_presence=False,
             )
-        
+
+        return source_dataset, target_datasets
+
+    def _get_leakage_free_ensemble_model_paths(self, eval_test_fold):
+        """Return Stage 1 model paths that did not train on the evaluated test fold."""
+        cv_folds = list(self.config["CV_FOLDS"])
+        val_offset = int(self.config.get("VAL_OFFSET", 1))
+        eligible_model_paths = []
+
+        for model_test_fold in cv_folds:
+            model_path = self.get_model_path(model_test_fold)
+            if not os.path.exists(model_path):
+                continue
+
+            model_val_fold = cv_folds[(cv_folds.index(model_test_fold) + val_offset) % len(cv_folds)]
+            model_train_folds = [f for f in cv_folds if f not in (model_test_fold, model_val_fold)]
+
+            if eval_test_fold in model_train_folds:
+                continue
+
+            eligible_model_paths.append(model_path)
+
+        return eligible_model_paths
+
+    def _evaluate_ensemble_with_segmentation(
+        self,
+        model_paths,
+        source_loader,
+        target_datasets,
+        segmentor_model,
+        output_prefix,
+    ):
+        """Evaluate an ensemble of Stage 1 models with downstream WMH segmentation."""
+        models = []
+        for model_path in model_paths:
+            model = ImageFlowNetODE(
+                device=self.config["DEVICE"],
+                in_channels=1,
+                ode_location='bottleneck',
+                contrastive=True,
+            ).to(self.config["DEVICE"])
+            model.load_state_dict(torch.load(model_path, map_location=self.config["DEVICE"]))
+            model.eval()
+            models.append(model)
+
+        tasks = {
+            "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": 3.0},
+            "Training_t3": {"scan_pair": "Scan3Wave4", "time": 6.0},
+            "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": 9.0},
+        }
+        metrics = {
+            name: {
+                "psnr_flair": torchmetrics.PeakSignalNoiseRatio(data_range=1.0).to(self.config["DEVICE"]),
+                "ssim_flair": torchmetrics.StructuralSimilarityIndexMeasure(data_range=1.0).to(self.config["DEVICE"]),
+                "dice_wmh": BinaryDice(threshold=0.5).to(self.config["DEVICE"]),
+            }
+            for name in tasks
+        }
         gt_lookup = self._create_gt_lookup(target_datasets)
-        
-        # 1. Flatten and calculate WMH sums
-        for task_name, patients in patient_predictions.items():
-            for p_id, slices in patients.items():
-                for s_idx, data in slices.items():
-                    wmh_sum = np.sum(data['wmh'] > 0.5)
-                    all_slices.append({
-                        'task': task_name,
-                        'patient_id': p_id,
-                        'slice_idx': s_idx,
-                        'wmh_sum': wmh_sum,
-                        'pred_flair': data['flair'],
-                        'pred_wmh': data['wmh']
-                    })
-        
-        # 2. Sort by volume (descending)
-        all_slices.sort(key=lambda x: x['wmh_sum'], reverse=True)
-        top_slices = all_slices[:top_n]
-        
-        if not top_slices:
-            print("⚠️ No slices found for visualization.")
-            return
-        
-        # 3. Create 4-column grid
-        fig, axes = plt.subplots(top_n, 4, figsize=(18, 4 * top_n))
-        if top_n == 1:
-            axes = axes.reshape(1, -1)
-        
-        for i, item in enumerate(top_slices):
-            p_id = item['patient_id']
-            s_idx = item['slice_idx']
-            task_info = tasks[item['task']]
-            gt_pair_name = task_info["scan_pair"]
-            
-            # Retrieve GT Data
-            gt_flair = np.zeros_like(item['pred_flair'])
-            gt_mask = np.zeros_like(item['pred_flair'])
-            
-            gt_idx = gt_lookup[gt_pair_name].get((p_id, s_idx))
-            if gt_idx is not None:
-                gt_sample = target_datasets[gt_pair_name][gt_idx]["target"]
-                gt_flair = gt_sample[0].cpu().numpy()
-                if gt_sample.shape[0] > 1:
-                    gt_mask = gt_sample[1].cpu().numpy()
-            
-            # Calculate slice-wise Dice
-            pred_binary = (item['pred_wmh'] > 0.5).astype(np.float32)
-            intersection = np.sum(pred_binary * gt_mask)
-            dice = (2. * intersection) / (np.sum(pred_binary) + np.sum(gt_mask) + 1e-8)
-            
-            # Col 0: GT FLAIR
-            axes[i, 0].imshow(gt_flair, cmap='gray')
-            axes[i, 0].set_title(f"GT FLAIR\nID: {p_id} | S{s_idx}")
-            
-            # Col 1: Predicted FLAIR
-            axes[i, 1].imshow(item['pred_flair'], cmap='gray')
-            axes[i, 1].set_title(f"Pred FLAIR\nTask: {item['task']}")
-            
-            # Col 2: GT WMH Mask
-            axes[i, 2].imshow(gt_mask, cmap='gray')
-            axes[i, 2].set_title("GT WMH Mask")
-            
-            # Col 3: Binary Prediction + Dice
-            axes[i, 3].imshow(pred_binary, cmap='gray')
-            axes[i, 3].set_title(f"Pred WMH Mask\nDice: {dice:.4f}")
-            
-            for ax in axes[i]:
-                ax.axis('off')
-        
-        plt.tight_layout()
-        save_path = os.path.join(self.plots_dir, "global_top_wmh_comparison.png")
-        plt.savefig(save_path, dpi=200, bbox_inches='tight')
-        plt.close()
-        print(f"🌟 Direct Comparison (4-col) saved to: {save_path}")
+        patient_predictions = {task_name: {} for task_name in tasks}
+        t_multiplier = self.config.get("T_MULTIPLIER", 1.0)
+
+        with torch.no_grad():
+            for source_batch in tqdm(source_loader, desc=f"Evaluating {output_prefix}"):
+                source_flair = source_batch["source"].to(self.config["DEVICE"])
+                patient_ids, slice_indices = source_batch["patient_id"], source_batch["slice_idx"]
+
+                for task_name, task_info in tasks.items():
+                    t = torch.tensor([task_info["time"] * t_multiplier], device=self.config["DEVICE"])
+                    ensemble_pred_flair = torch.stack(
+                        [model(source_flair, t=t) for model in models],
+                        dim=0,
+                    ).mean(dim=0)
+
+                    pred_flair_normalized = torch.zeros_like(ensemble_pred_flair)
+                    for sample_idx in range(ensemble_pred_flair.shape[0]):
+                        sample = ensemble_pred_flair[sample_idx]
+                        min_val = sample.min()
+                        max_val = sample.max()
+                        if max_val > min_val:
+                            pred_flair_normalized[sample_idx] = (sample - min_val) / (max_val - min_val)
+                        else:
+                            pred_flair_normalized[sample_idx] = sample
+                    pred_flair_normalized = torch.clamp(pred_flair_normalized, 0.0, 1.0)
+                    pred_wmh_prob = torch.sigmoid(segmentor_model(pred_flair_normalized))
+
+                    gt_pair_name = task_info["scan_pair"]
+                    target_flair_valid = []
+                    target_wmh_valid = []
+                    pred_flair_valid = []
+                    pred_wmh_prob_valid = []
+
+                    for j in range(len(patient_ids)):
+                        p_id = patient_ids[j]
+                        p_id_str = str(p_id.item()).zfill(4) if isinstance(p_id, torch.Tensor) else str(p_id).zfill(4)
+                        s_idx = slice_indices[j].item()
+                        gt_idx = gt_lookup[gt_pair_name].get((p_id_str, s_idx))
+                        if gt_idx is None:
+                            continue
+
+                        gt_sample = target_datasets[gt_pair_name][gt_idx]
+                        tgt = gt_sample["target"].to(self.config["DEVICE"])
+                        target_flair_valid.append(tgt[0:1, :, :])
+                        if tgt.shape[0] > 1:
+                            target_wmh_valid.append(tgt[1:2, :, :].int())
+                        else:
+                            target_wmh_valid.append(torch.zeros_like(tgt[0:1, :, :]).int())
+
+                        pred_flair_valid.append(ensemble_pred_flair[j, 0:1, :, :])
+                        pred_wmh_prob_valid.append(pred_wmh_prob[j, 0:1, :, :])
+
+                        if p_id_str not in patient_predictions[task_name]:
+                            patient_predictions[task_name][p_id_str] = {}
+                        patient_predictions[task_name][p_id_str][s_idx] = {
+                            "flair": ensemble_pred_flair[j, 0].cpu().numpy(),
+                            "wmh": pred_wmh_prob[j, 0].cpu().numpy(),
+                        }
+
+                    if not target_flair_valid:
+                        continue
+
+                    target_flair_batch = torch.stack(target_flair_valid)
+                    pred_flair_batch = torch.stack(pred_flair_valid)
+                    target_wmh_batch = torch.stack(target_wmh_valid)
+                    pred_wmh_prob_batch = torch.stack(pred_wmh_prob_valid)
+
+                    metrics[task_name]["psnr_flair"].update(pred_flair_batch, target_flair_batch)
+                    metrics[task_name]["ssim_flair"].update(pred_flair_batch, target_flair_batch)
+                    metrics[task_name]["dice_wmh"].update(pred_wmh_prob_batch, target_wmh_batch)
+
+        final_results = {"ensemble_name": output_prefix}
+        for task_name in tasks:
+            final_results[task_name] = {
+                "PSNR": metrics[task_name]["psnr_flair"].compute().item(),
+                "SSIM": metrics[task_name]["ssim_flair"].compute().item(),
+                "Dice": metrics[task_name]["dice_wmh"].compute().item(),
+            }
+
+        self._save_3d_predictions_with_prefix(patient_predictions, tasks, output_prefix)
+        return final_results, patient_predictions
     
+    def _save_3d_predictions_with_prefix(self, patient_predictions, tasks, output_prefix):
+        """Save 3D FLAIR and WMH predictions using a caller-provided prefix."""
+        import nibabel as nib
+
+        original_scans_dir = os.path.join(self.config["ROOT_DIR"], "Scan1Wave2_FLAIR_brain")
+
+        for task_name, task_info in tasks.items():
+            predictions_by_patient = patient_predictions[task_name]
+            gt_pair_name = task_info["scan_pair"]
+
+            flair_save_dir = os.path.join(self.results_dir, f"{output_prefix}_Pred_{gt_pair_name}_FLAIR_3D")
+            wmh_save_dir = os.path.join(self.results_dir, f"{output_prefix}_Pred_{gt_pair_name}_WMH_3D")
+            os.makedirs(flair_save_dir, exist_ok=True)
+            os.makedirs(wmh_save_dir, exist_ok=True)
+
+            for patient_id, slices in predictions_by_patient.items():
+                if not slices:
+                    continue
+
+                max_slice_idx = max(slices.keys())
+                h, w = next(iter(slices.values()))["flair"].shape
+                flair_volume = np.zeros((h, w, max_slice_idx + 1), dtype=np.float32)
+                wmh_volume = np.zeros((h, w, max_slice_idx + 1), dtype=np.float32)
+
+                for slice_idx, pred_data in slices.items():
+                    flair_volume[:, :, slice_idx] = pred_data["flair"]
+                    wmh_volume[:, :, slice_idx] = pred_data["wmh"]
+
+                affine = np.eye(4)
+                try:
+                    full_prefix = f"LBC36{patient_id.zfill(4)}"
+                    original_file = next(f for f in os.listdir(original_scans_dir) if f.startswith(full_prefix))
+                    affine = nib.load(os.path.join(original_scans_dir, original_file)).affine
+                except Exception:
+                    pass
+
+                nib.save(
+                    nib.Nifti1Image(flair_volume, affine),
+                    os.path.join(flair_save_dir, f"{patient_id}_predicted_flair_3D.nii.gz"),
+                )
+                nib.save(
+                    nib.Nifti1Image(wmh_volume, affine),
+                    os.path.join(wmh_save_dir, f"{patient_id}_predicted_wmh_3D.nii.gz"),
+                )
+
     def _report_test_results(self, all_results):
         """Aggregate and report test set results."""
         print("\n" + "="*60)
@@ -988,89 +673,6 @@ class Experiment1(BaseExperiment):
         print(f"\n📊 Test results saved to {csv_path}")
         print("="*60)
     
-    def _analyze_wmh_volumes_experiment3(self):
-        """
-        Analyze WMH volume progression across the test set.
-        Searches across all fold-specific result directories for each patient.
-        """
-        import nibabel as nib
-        from utils import calculate_volume_ml, get_ground_truth_wmh_volume
-        
-        time_points = ["Scan2Wave3", "Scan3Wave4", "Scan4Wave5"]
-        time_labels = {"Scan2Wave3": "t2", "Scan3Wave4": "t3", "Scan4Wave5": "t4"}
-        
-        # GT directories
-        gt_wmh_dirs = {label: os.path.join(self.config["ROOT_DIR"], f"{scan}_WMH")
-                      for scan, label in time_labels.items()}
-        
-        volume_results = {}
-        possible_folds = self.config["CV_FOLDS"]
-        
-        if not hasattr(self, 'test_patient_ids') or not self.test_patient_ids:
-            print("⚠️ No test_patient_ids found.")
-            return
-        
-        print(f"📊 Starting volume analysis for {len(self.test_patient_ids)} patients...")
-        
-        for patient_id in self.test_patient_ids:
-            patient_volumes = {'predicted': [], 'ground_truth': [], 'time_points': []}
-            
-            for scan in time_points:
-                time_label = time_labels[scan]
-                pred_wmh_file = None
-                
-                # Check which fold directory contains this patient's data
-                for f_idx in possible_folds:
-                    folder_name = f"model_fold_{f_idx}_Pred_{scan}_WMH_3D"
-                    file_path = os.path.join(self.results_dir, folder_name, f"{patient_id}_predicted_wmh_3D.nii.gz")
-                    
-                    if os.path.exists(file_path):
-                        pred_wmh_file = file_path
-                        break
-                
-                if pred_wmh_file:
-                    try:
-                        # Load Prediction
-                        pred_nii = nib.load(pred_wmh_file)
-                        pred_vol = pred_nii.get_fdata(dtype=np.float32)
-                        pred_ml = calculate_volume_ml((pred_vol > 0.5), affine=pred_nii.affine)
-                        
-                        # Load Ground Truth
-                        gt_vol, gt_affine = get_ground_truth_wmh_volume(gt_wmh_dirs[time_label], patient_id)
-                        gt_ml = calculate_volume_ml(gt_vol, affine=gt_affine) if gt_vol is not None else 0
-                        
-                        patient_volumes['predicted'].append(pred_ml)
-                        patient_volumes['ground_truth'].append(gt_ml)
-                        patient_volumes['time_points'].append(time_label)
-                    except Exception as e:
-                        print(f"⚠️ Error processing {patient_id} in {time_label}: {e}")
-            
-            if patient_volumes['predicted']:
-                volume_results[patient_id] = patient_volumes
-        
-        # Plotting and CSV Export
-        if volume_results:
-            save_plot_path = os.path.join(self.plots_dir, "wmh_volume_progression.png")
-            plot_volume_progression(volume_results, save_plot_path)
-            
-            # Save to CSV
-            rows = []
-            for pid, data in volume_results.items():
-                for i in range(len(data['time_points'])):
-                    rows.append({
-                        'patient_id': pid,
-                        'time_point': data['time_points'][i],
-                        'predicted_ml': data['predicted'][i],
-                        'ground_truth_ml': data['ground_truth'][i],
-                        'error_ml': data['predicted'][i] - data['ground_truth'][i]
-                    })
-            
-            csv_path = os.path.join(self.results_dir, "volume_analysis.csv")
-            pd.DataFrame(rows).to_csv(csv_path, index=False)
-            print(f"✅ Volume analysis complete. Summary saved to {csv_path}")
-        else:
-            print("❌ Error: No predicted NIfTI files found. Check your results_dir paths.")
-    
     def _analyze_wmh_volumes_with_pretrained_models(self, predicted_flair_base_dir, gt_wmh_dirs, 
                                                     time_points, fold_to_model, folds_dict):
         """
@@ -1102,30 +704,8 @@ class Experiment1(BaseExperiment):
                 for patient_id in patient_ids:
                     patient_to_model[patient_id] = (fold_num, model_path)
         
-        # Find all prediction directories for each time point
-        pred_dirs_by_timepoint = {}
-        for time_point in time_points:
-            for folder in os.listdir(predicted_flair_base_dir):
-                folder_path = os.path.join(predicted_flair_base_dir, folder)
-                if os.path.isdir(folder_path) and f"Pred_{time_point}_FLAIR_3D" in folder:
-                    pred_dirs_by_timepoint[time_point] = folder_path
-                    break
-        
-        if not pred_dirs_by_timepoint:
-            print("⚠️ No prediction directories found matching pattern 'Pred_*_FLAIR_3D'")
-            return {}
-        
-        # Collect all unique patient IDs from predictions
-        all_patients = set()
-        for time_point, pred_dir in pred_dirs_by_timepoint.items():
-            if os.path.exists(pred_dir):
-                for pred_file in os.listdir(pred_dir):
-                    if pred_file.endswith('_predicted_flair_3D.nii.gz'):
-                        match = re.match(r"(\d+)_predicted_flair_3D\.nii\.gz", pred_file)
-                        if match:
-                            all_patients.add(match.group(1))
-        
-        print(f"Found {len(all_patients)} unique patients in predictions")
+        all_patients = set(patient_to_model.keys())
+        print(f"Found {len(all_patients)} patients with fold assignments")
         
         # Load models only once per fold
         loaded_models = {}
@@ -1149,10 +729,13 @@ class Experiment1(BaseExperiment):
             patient_volumes = {'predicted': [], 'ground_truth': [], 'time_points': []}
             
             for time_point in time_points:
-                if time_point not in pred_dirs_by_timepoint:
+                pred_dir = os.path.join(
+                    predicted_flair_base_dir,
+                    f"ensemble_test_fold_{fold_num}_Pred_{time_point}_FLAIR_3D",
+                )
+                if not os.path.exists(pred_dir):
                     continue
-                
-                pred_dir = pred_dirs_by_timepoint[time_point]
+
                 pred_file = f"{patient_id}_predicted_flair_3D.nii.gz"
                 pred_flair_path = os.path.join(pred_dir, pred_file)
                 
@@ -1193,23 +776,11 @@ class Experiment1(BaseExperiment):
         print("Starting Stage 2 (WMH Segmentation with Pretrained Models)")
         print("="*60)
         
-        predicted_flair_dir_3d = f"{pred_flair_dir}_3D"
-        
-        if not os.path.exists(predicted_flair_dir_3d):
-            print(f"[Stage 2] Directory not found: {predicted_flair_dir_3d}")
-            return
-        
         if not os.path.exists(wmh_gt_dir):
             print(f"[Stage 2] Directory not found: {wmh_gt_dir}")
             return
         
-        # Check for pretrained SwinUNETR models directory
         swinunetr_models_dir = self.config.get("SWINUNETR_MODELS_DIR", "swinunetr_models")
-        if not os.path.exists(swinunetr_models_dir):
-            print(f"⚠️ Pretrained SwinUNETR models directory not found: {swinunetr_models_dir}")
-            print(f"Please run train_swinunetr_4fold.py first to generate pretrained models.")
-            return
-        
         print(f"✅ Using pretrained SwinUNETR models from: {swinunetr_models_dir}")
         print("Note: Skipping retraining as pretrained models are available.\n")
         
@@ -1219,23 +790,7 @@ class Experiment1(BaseExperiment):
         val_offset = int(self.config.get("VAL_OFFSET", 1))
         cv_folds = list(self.config["CV_FOLDS"])
         
-        # Map test folds to their corresponding pretrained models
-        # The naming convention from train_swinunetr_4fold.py is: wmh_swinunetr_test{test_split}_val{val_split}.pth
-        fold_to_model = {}
-        for test_fold in cv_folds:
-            val_fold = cv_folds[(cv_folds.index(test_fold) + val_offset) % len(cv_folds)]
-            model_filename = f"wmh_swinunetr_test{test_fold}_val{val_fold}.pth"
-            model_path = os.path.join(swinunetr_models_dir, model_filename)
-            
-            if os.path.exists(model_path):
-                fold_to_model[test_fold] = model_path
-                print(f"✅ Found model for test fold {test_fold}: {model_filename}")
-            else:
-                print(f"⚠️ Model not found for test fold {test_fold}: {model_filename}")
-        
-        if not fold_to_model:
-            print("❌ No pretrained models found. Cannot proceed with Stage 2.")
-            return
+        fold_to_model, _ = self._load_fold_specific_segmentors()
         
         print(f"\n📊 Total pretrained models available: {len(fold_to_model)}")
         
@@ -1304,10 +859,15 @@ class Experiment1(BaseExperiment):
 # ============================================================
 
 if __name__ == "__main__":
+    """
+    Run this experiment directly without going through main.py
+    Usage: python flair_to_flair.py
+    """
     print("\n" + "="*70)
-    print("🧪 Running Experiment 1: FLAIR → FLAIR (Standalone Mode)")
+    print("🧪 Running Experiment BL: FLAIR → FLAIR (Standalone Mode)")
     print("="*70 + "\n")
     
+    # Import config from main.py (reuse the same config)
     from main import CONFIG as MAIN_CONFIG
     CONFIG = MAIN_CONFIG
     
@@ -1315,14 +875,14 @@ if __name__ == "__main__":
     
     # Experiment configuration
     experiment_config = {
-        "name": "flair_to_flair_baseline",
-        "description": "FLAIR -> FLAIR (two-stage: prediction then segmentation, loss: L1 only)",
+        "name": "flair_to_flair_bl",
+        "description": "FLAIR -> FLAIR baseline (two-stage: prediction then segmentation)",
         "use_wmh": True,
-        "class": Experiment1
+        "class": ExperimentBL
     }
     
     # Run experiment
-    experiment = Experiment1(
+    experiment = ExperimentBL(
         experiment_number=1,
         experiment_config=experiment_config,
         config=CONFIG

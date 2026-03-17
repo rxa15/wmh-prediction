@@ -385,13 +385,34 @@ class FLAIREvolutionDataset(Dataset):
         require_wmh_presence: If True (default), only include slices with WMH > 0.
                              If False, include all slices regardless of WMH presence.
     """
-    def __init__(self, root_dir, transform=None, max_slices_per_patient=None, use_wmh=False, training_pairs=None, use_flair_output=True, require_wmh_presence=True):
+    def __init__(
+        self,
+        root_dir,
+        transform=None,
+        max_slices_per_patient=None,
+        use_wmh=False,
+        training_pairs=None,
+        use_flair_output=True,
+        require_wmh_presence=True,
+        slice_selection_mode="uniform",
+        valid_slice_mode="wmh",
+        brain_threshold=0.0,
+        min_brain_pixels=100,
+        slice_axis=2,
+        random_seed=42,
+    ):
         self.root_dir = root_dir
         self.transform = transform
         self.use_wmh = use_wmh
         self.training_pairs = training_pairs
         self.use_flair_output = use_flair_output
         self.require_wmh_presence = require_wmh_presence
+        self.slice_selection_mode = slice_selection_mode
+        self.valid_slice_mode = valid_slice_mode
+        self.brain_threshold = brain_threshold
+        self.min_brain_pixels = min_brain_pixels
+        self.slice_axis = slice_axis
+        self.random_seed = random_seed
         self.index_map = []
         self.patient_ids = set()
         self._vol_minmax_cache = {}
@@ -512,27 +533,17 @@ class FLAIREvolutionDataset(Dataset):
             if target_wmh_vol is not None:
                 num_slices = min(num_slices, target_wmh_vol.shape[2])
 
-            slice_indices = list(range(14, num_slices))
-            if max_slices_per_patient and len(slice_indices) > max_slices_per_patient:
-                step = len(slice_indices) / max_slices_per_patient
-                slice_indices = [int(i * step) for i in range(max_slices_per_patient)]
+            valid_slice_indices = self._compute_valid_slice_indices(
+                source_vol=source_vol[:, :, :num_slices],
+                target_vol=target_vol[:, :, :num_slices],
+                source_wmh_vol=source_wmh_vol[:, :, :num_slices] if source_wmh_vol is not None else None,
+                target_wmh_vol=target_wmh_vol[:, :, :num_slices] if target_wmh_vol is not None else None,
+                patient_id=patient_id,
+                scan_pair=scan_pair,
+                max_slices_per_patient=max_slices_per_patient,
+            )
 
-            for s_idx in slice_indices:
-                # Check for WMH presence if required
-                if self.require_wmh_presence:
-                    # WMH-only mode:
-                    # Prefer target WMH (ground truth at target timepoint) when available.
-                    # Fall back to source WMH if target WMH is missing.
-                    if target_wmh_vol is not None:
-                        has_wmh = target_wmh_vol[:, :, s_idx].sum() > 0
-                    elif source_wmh_vol is not None:
-                        has_wmh = source_wmh_vol[:, :, s_idx].sum() > 0
-                    else:
-                        has_wmh = False
-
-                    if not has_wmh:
-                        continue  # Skip slices without WMH
-                
+            for s_idx in valid_slice_indices:
                 self.index_map.append({
                     "patient_id": patient_id,
                     "scan_pair": scan_pair,
@@ -547,6 +558,107 @@ class FLAIREvolutionDataset(Dataset):
         except Exception as e:
             print(f"⚠️ Could not load scan pair: {e}")
 
+    def _get_foreground_slice_indices(self, volume):
+        """Return slice indices whose image contains enough non-background pixels."""
+        if volume is None or volume.size == 0:
+            return set()
+
+        volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
+        valid_indices = set()
+        num_slices = volume.shape[self.slice_axis]
+
+        for slice_idx in range(num_slices):
+            slice_data = np.take(volume, slice_idx, axis=self.slice_axis)
+            num_foreground = int((slice_data > self.brain_threshold).sum())
+            if num_foreground > self.min_brain_pixels:
+                valid_indices.add(slice_idx)
+
+        return valid_indices
+
+    def _get_wmh_slice_indices(self, volume):
+        """Return z-indices whose WMH mask is non-empty."""
+        if volume is None or volume.size == 0:
+            return set()
+        valid_indices = set()
+        num_slices = volume.shape[self.slice_axis]
+
+        for slice_idx in range(num_slices):
+            slice_data = np.take(volume, slice_idx, axis=self.slice_axis)
+            if (slice_data > 0).any():
+                valid_indices.add(slice_idx)
+
+        return valid_indices
+
+    def _select_slice_subset(self, slice_indices, max_slices_per_patient, patient_id, scan_pair):
+        if not slice_indices:
+            return []
+
+        if max_slices_per_patient is None or len(slice_indices) <= max_slices_per_patient:
+            return slice_indices
+
+        if self.slice_selection_mode == "random_valid":
+            seed_key = f"{patient_id}_{scan_pair}_{self.random_seed}"
+            seed = sum(ord(ch) for ch in seed_key) % (2**32)
+            rng = np.random.default_rng(seed)
+            chosen = rng.choice(slice_indices, size=max_slices_per_patient, replace=False)
+            return sorted(int(idx) for idx in chosen.tolist())
+
+        step = len(slice_indices) / max_slices_per_patient
+        return [slice_indices[int(i * step)] for i in range(max_slices_per_patient)]
+
+    def _compute_valid_slice_indices(
+        self,
+        source_vol,
+        target_vol,
+        source_wmh_vol,
+        target_wmh_vol,
+        patient_id,
+        scan_pair,
+        max_slices_per_patient,
+    ):
+        all_slice_indices = list(range(source_vol.shape[self.slice_axis]))
+        brain_slices = self._get_foreground_slice_indices(source_vol) | self._get_foreground_slice_indices(target_vol)
+        wmh_slices = self._get_wmh_slice_indices(target_wmh_vol) | self._get_wmh_slice_indices(source_wmh_vol)
+
+        mode_aliases = {
+            "brain": "brain",
+            "foreground": "brain",
+            "foreground_only": "brain",
+            "wmh": "wmh",
+            "wmh_only": "wmh",
+            "foreground_or_wmh": "brain_or_wmh",
+            "brain_or_wmh": "brain_or_wmh",
+        }
+        mode = mode_aliases.get(self.valid_slice_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported valid_slice_mode='{self.valid_slice_mode}'. "
+                "Expected one of: brain, wmh, brain_or_wmh."
+            )
+
+        if self.require_wmh_presence:
+            mode = "wmh"
+
+        if mode == "brain":
+            valid_slice_indices = sorted(brain_slices)
+        elif mode == "brain_or_wmh":
+            valid_slice_indices = sorted(brain_slices | wmh_slices)
+        else:
+            valid_slice_indices = sorted(wmh_slices)
+
+        if not valid_slice_indices:
+            valid_slice_indices = sorted(brain_slices)
+
+        if not valid_slice_indices:
+            valid_slice_indices = all_slice_indices
+
+        return self._select_slice_subset(
+            valid_slice_indices,
+            max_slices_per_patient=max_slices_per_patient,
+            patient_id=patient_id,
+            scan_pair=scan_pair,
+        )
+
     def _get_volume_minmax(self, file_path):
         """Return (vmin, vmax) for a 3D volume, cached per file path."""
         if file_path in self._vol_minmax_cache:
@@ -559,7 +671,7 @@ class FLAIREvolutionDataset(Dataset):
 
     def _load_slice(self, file_path, slice_idx, vmin=None, vmax=None):
         img = nib.load(file_path)
-        img_slice = np.asanyarray(img.dataobj[:, :, slice_idx], dtype=np.float32)
+        img_slice = np.asanyarray(np.take(img.dataobj, slice_idx, axis=self.slice_axis), dtype=np.float32)
         
         # Check for NaN/Inf in loaded data
         if np.isnan(img_slice).any() or np.isinf(img_slice).any():
@@ -709,6 +821,361 @@ class SwinUNetSegmentation(nn.Module):
 
 
 # ============================================================
+# === FLAIR-ONLY EXPERIMENT HELPERS ===
+# ============================================================
+
+ALL_FLAIR_TEMPORAL_PAIRS = [
+    ("Scan1Wave2", "Scan2Wave3", 3.0),
+    ("Scan1Wave2", "Scan3Wave4", 6.0),
+    ("Scan1Wave2", "Scan4Wave5", 9.0),
+    ("Scan2Wave3", "Scan3Wave4", 3.0),
+    ("Scan2Wave3", "Scan4Wave5", 6.0),
+    ("Scan3Wave4", "Scan4Wave5", 3.0),
+]
+
+FLAIR_EVAL_TASKS = {
+    "Scan2Wave3": 3.0,
+    "Scan3Wave4": 6.0,
+    "Scan4Wave5": 9.0,
+}
+
+
+def load_patient_ids_from_csv(csv_path, column="patient_ID", normalize=False):
+    df = pd.read_csv(csv_path)
+    if column not in df.columns:
+        raise ValueError(f"Column '{column}' not found in {csv_path}. Columns: {list(df.columns)}")
+
+    patient_ids = []
+    for value in df[column].astype(str).tolist():
+        patient_id = str(value).strip()
+        if normalize:
+            patient_id = re.sub(r"^LBC36", "", patient_id)
+            patient_id = re.sub(r"^LBC", "", patient_id)
+            patient_id = re.sub(r"[^\d]", "", patient_id)
+            patient_id = patient_id.zfill(4)
+        patient_ids.append(patient_id)
+    return patient_ids
+
+
+def compute_prediction_ssim(model, loader, device, t_multiplier=1.0):
+    model.eval()
+    ssim_metric = torchmetrics.StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
+    with torch.no_grad():
+        for batch in loader:
+            source_img = batch["source"].to(device)
+            target_img = batch["target"].to(device)
+            time_deltas = batch["time_delta"].to(device)
+
+            for t, mask in _iter_time_delta_groups(time_deltas):
+                predicted_target = model(source_img[mask], t * t_multiplier)
+                ssim_metric.update(predicted_target, target_img[mask])
+
+    return ssim_metric.compute().item()
+
+
+def get_patient_subset_indices(dataset, patient_ids):
+    patient_ids = set(patient_ids)
+    return [i for i, item in enumerate(dataset.index_map) if item["patient_id"] in patient_ids]
+
+
+def make_patient_subset_loader(dataset, patient_ids, batch_size, shuffle=False, num_workers=0):
+    indices = get_patient_subset_indices(dataset, patient_ids)
+    return DataLoader(
+        Subset(dataset, indices),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+    )
+
+
+def save_training_history(history, csv_path):
+    history_df = pd.DataFrame({"epoch": range(1, len(next(iter(history.values()))) + 1), **history})
+    history_df.to_csv(csv_path, index=False)
+    return history_df
+
+
+def create_flair_eval_datasets(root_dir, max_slices, use_wmh=False, require_wmh_presence=False):
+    datasets = {}
+    for target_scan, time_delta in FLAIR_EVAL_TASKS.items():
+        datasets[target_scan] = FLAIREvolutionDataset(
+            root_dir=root_dir,
+            max_slices_per_patient=max_slices,
+            use_wmh=use_wmh,
+            require_wmh_presence=require_wmh_presence,
+            training_pairs=[("Scan1Wave2", target_scan, time_delta)],
+        )
+    return datasets
+
+
+def _save_flair_test_results(results_dir, all_results, fold_labels):
+    interp_psnrs = [r["Interpolation_t2"]["PSNR"] for r in all_results]
+    train_psnrs = [r["Training_t3"]["PSNR"] for r in all_results]
+    extrap_psnrs = [r["Extrapolation_t4"]["PSNR"] for r in all_results]
+
+    print("\n" + "=" * 60)
+    print("============= Final Test Set Results (Mean +/- Std Dev) =============")
+    print("=" * 60)
+    print(f"Interpolation PSNR (t1->t2, Δt=1.0): {np.mean(interp_psnrs):.4f} +/- {np.std(interp_psnrs):.4f}")
+    print(f"Training PSNR      (t1->t3, Δt=2.0): {np.mean(train_psnrs):.4f} +/- {np.std(train_psnrs):.4f}")
+    print(f"Extrapolation PSNR (t1->t4, Δt=3.0): {np.mean(extrap_psnrs):.4f} +/- {np.std(extrap_psnrs):.4f}")
+    print("=" * 60)
+
+    rows = []
+    for fold_label, result in zip(fold_labels, all_results):
+        rows.append({
+            "fold": fold_label,
+            "model_path": os.path.basename(result["model_path"]),
+            "interpolation_t2_psnr": result["Interpolation_t2"]["PSNR"],
+            "interpolation_t2_ssim": result["Interpolation_t2"]["SSIM"],
+            "training_t3_psnr": result["Training_t3"]["PSNR"],
+            "training_t3_ssim": result["Training_t3"]["SSIM"],
+            "extrapolation_t4_psnr": result["Extrapolation_t4"]["PSNR"],
+            "extrapolation_t4_ssim": result["Extrapolation_t4"]["SSIM"],
+        })
+
+    rows.extend([
+        {
+            "fold": "mean",
+            "model_path": "N/A",
+            "interpolation_t2_psnr": np.mean(interp_psnrs),
+            "interpolation_t2_ssim": np.mean([r["Interpolation_t2"]["SSIM"] for r in all_results]),
+            "training_t3_psnr": np.mean(train_psnrs),
+            "training_t3_ssim": np.mean([r["Training_t3"]["SSIM"] for r in all_results]),
+            "extrapolation_t4_psnr": np.mean(extrap_psnrs),
+            "extrapolation_t4_ssim": np.mean([r["Extrapolation_t4"]["SSIM"] for r in all_results]),
+        },
+        {
+            "fold": "std",
+            "model_path": "N/A",
+            "interpolation_t2_psnr": np.std(interp_psnrs),
+            "interpolation_t2_ssim": np.std([r["Interpolation_t2"]["SSIM"] for r in all_results]),
+            "training_t3_psnr": np.std(train_psnrs),
+            "training_t3_ssim": np.std([r["Training_t3"]["SSIM"] for r in all_results]),
+            "extrapolation_t4_psnr": np.std(extrap_psnrs),
+            "extrapolation_t4_ssim": np.std([r["Extrapolation_t4"]["SSIM"] for r in all_results]),
+        },
+    ])
+
+    csv_path = os.path.join(results_dir, "test_set_evaluation_results.csv")
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    print(f"📊 Test set evaluation results saved to {csv_path}\n")
+
+    best_result = max(all_results, key=lambda x: x["Training_t3"]["PSNR"])
+    best_model_name = os.path.basename(best_result["model_path"]).split(".")[0]
+    print(f"🏆 Best model: {best_model_name} (Training PSNR: {max(train_psnrs):.4f})")
+    return best_model_name
+
+
+def evaluate_flair_cv_test_splits(experiment, folds_dict, val_offset=1, require_wmh_presence=True):
+    print("\n" + "=" * 60)
+    print("✅ CV Training Complete. Starting Final Evaluation on Per-Fold Test Splits.")
+    print("=" * 60)
+
+    eval_datasets = create_flair_eval_datasets(
+        root_dir=experiment.config["ROOT_DIR"],
+        max_slices=experiment.config["MAX_SLICES"],
+        use_wmh=False,
+        require_wmh_presence=require_wmh_presence,
+    )
+    original_scans_dir = os.path.join(experiment.config["ROOT_DIR"], "Scan1Wave2_FLAIR_brain")
+
+    all_results = []
+    fold_labels = []
+    cv_folds = list(experiment.config["CV_FOLDS"])
+    for test_fold in cv_folds:
+        val_fold = cv_folds[(cv_folds.index(test_fold) + int(val_offset)) % len(cv_folds)]
+        test_pids = folds_dict[test_fold]
+
+        source_loader = make_patient_subset_loader(
+            eval_datasets["Scan2Wave3"],
+            test_pids,
+            experiment.config["BATCH_SIZE"],
+            shuffle=False,
+        )
+        gt_loaders = {
+            scan_name: make_patient_subset_loader(
+                dataset,
+                test_pids,
+                experiment.config["BATCH_SIZE"],
+                shuffle=False,
+            )
+            for scan_name, dataset in eval_datasets.items()
+        }
+
+        model_path = experiment.get_model_path(test_fold)
+        if not os.path.exists(model_path):
+            print(f"⚠️ Model for test fold {test_fold} not found: {model_path}")
+            continue
+
+        result = evaluate_and_visualize_flair_tasks(
+            model_path,
+            source_loader,
+            gt_loaders,
+            experiment.config["DEVICE"],
+            original_scans_dir,
+            in_channels=1,
+            out_channels=1,
+            results_dir=experiment.results_dir,
+        )
+        result["fold"] = test_fold
+        result["val_fold"] = val_fold
+        all_results.append(result)
+        fold_labels.append(test_fold)
+
+    if not all_results:
+        print("No trained models found to evaluate.")
+        return None, None
+
+    best_model_name = _save_flair_test_results(experiment.results_dir, all_results, fold_labels)
+    print(f"\n{'=' * 60}")
+    print("✅ Stage 1 Complete - ImageFlowNet Training and Evaluation")
+    print(f"{'=' * 60}")
+    predicted_flair_dir = os.path.join(experiment.results_dir, f"{best_model_name}_Pred_Scan3Wave4")
+    ground_truth_wmh_dir = os.path.join(experiment.config["ROOT_DIR"], "Scan3Wave4_WMH")
+    return predicted_flair_dir, ground_truth_wmh_dir
+
+
+def evaluate_flair_heldout_test_set(experiment):
+    print("\n" + "=" * 60)
+    print("✅ CV Training Complete. Starting Final Evaluation on Held-Out Test Set.")
+    print("=" * 60)
+
+    test_pids = experiment.test_patient_ids
+    source_dataset = FLAIREvolutionDataset(
+        root_dir=experiment.config["ROOT_DIR"],
+        max_slices_per_patient=experiment.config["MAX_SLICES"],
+        use_wmh=experiment.use_wmh,
+        training_pairs=[("Scan1Wave2", "Scan1Wave2", 0.0)],
+    )
+    target_datasets = {
+        target_scan: FLAIREvolutionDataset(
+            root_dir=experiment.config["ROOT_DIR"],
+            max_slices_per_patient=experiment.config["MAX_SLICES"],
+            use_wmh=experiment.use_wmh,
+            training_pairs=[(target_scan, target_scan, 0.0)],
+        )
+        for target_scan in FLAIR_EVAL_TASKS
+    }
+
+    source_loader = make_patient_subset_loader(
+        source_dataset,
+        test_pids,
+        experiment.config["BATCH_SIZE"],
+        shuffle=False,
+    )
+    gt_loaders = {
+        scan_name: make_patient_subset_loader(
+            dataset,
+            test_pids,
+            experiment.config["BATCH_SIZE"],
+            shuffle=False,
+        )
+        for scan_name, dataset in target_datasets.items()
+    }
+
+    model_paths = [
+        experiment.get_model_path(fold_idx)
+        for fold_idx in experiment.config["CV_FOLDS"]
+        if os.path.exists(experiment.get_model_path(fold_idx))
+    ]
+    if not model_paths:
+        print("No trained models found to evaluate.")
+        return None, None
+
+    original_scans_dir = os.path.join(experiment.config["ROOT_DIR"], "Scan1Wave2_FLAIR_brain")
+    all_results = [
+        evaluate_and_visualize_flair_tasks(
+            model_path,
+            source_loader,
+            gt_loaders,
+            experiment.config["DEVICE"],
+            original_scans_dir,
+            in_channels=1,
+            out_channels=1,
+            results_dir=experiment.results_dir,
+        )
+        for model_path in model_paths
+    ]
+
+    best_model_name = _save_flair_test_results(
+        experiment.results_dir,
+        all_results,
+        experiment.config["CV_FOLDS"][:len(all_results)],
+    )
+    predicted_flair_dir = os.path.join(experiment.results_dir, f"{best_model_name}_Pred_Scan3Wave4")
+    ground_truth_wmh_dir = os.path.join(experiment.config["ROOT_DIR"], "Scan3Wave4_WMH")
+    return predicted_flair_dir, ground_truth_wmh_dir
+
+
+def run_standard_flair_stage2(experiment, pred_flair_dir, wmh_gt_dir):
+    print("\n" + "=" * 60)
+    print("Starting Stage 2 (WMH Segmentation)")
+    print("=" * 60)
+
+    predicted_flair_dir_3d = f"{pred_flair_dir}_3D"
+    if not os.path.exists(predicted_flair_dir_3d):
+        print(f"[Stage 2] Directory not found: {predicted_flair_dir_3d}")
+        return
+    if not os.path.exists(wmh_gt_dir):
+        print(f"[Stage 2] Directory not found: {wmh_gt_dir}")
+        return
+
+    run_stage2_segmentation(
+        predicted_flair_dir_3d,
+        wmh_gt_dir,
+        experiment.config["DEVICE"],
+        experiment.models_dir,
+        experiment.config["NUM_EPOCHS"],
+    )
+
+    print("\n" + "=" * 60)
+    print("Performing WMH Volume Progression Analysis")
+    print("=" * 60 + "\n")
+
+    time_points = ["Scan1Wave2", "Scan2Wave3", "Scan3Wave4", "Scan4Wave5"]
+    gt_wmh_dirs = {tp: os.path.join(experiment.config["ROOT_DIR"], f"{tp}_WMH") for tp in time_points}
+    missing = [tp for tp, path in gt_wmh_dirs.items() if not os.path.exists(path)]
+    if missing:
+        print(f"⚠️ Missing directories for: {missing}")
+        return
+
+    volume_results = analyze_wmh_volume_progression(
+        experiment.results_dir,
+        experiment.models_dir,
+        gt_wmh_dirs,
+        time_points,
+        experiment.config["DEVICE"],
+    )
+    if not volume_results:
+        return
+
+    plot_volume_progression(volume_results, experiment.get_plots_path("volume_progression.png"))
+    rows = []
+    for patient_id, volumes in volume_results.items():
+        for idx, time_point in enumerate(volumes["time_points"]):
+            rows.append({
+                "patient_id": patient_id,
+                "time_point": time_point,
+                "predicted_wmh_ml": volumes["predicted"][idx],
+                "ground_truth_wmh_ml": volumes["ground_truth"][idx],
+                "volume_error_ml": volumes["predicted"][idx] - volumes["ground_truth"][idx],
+            })
+
+    df = pd.DataFrame(rows)
+    csv_path = experiment.get_results_path(f"wmh_volume_progression_{experiment.name}.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"✅ Volume progression results saved to {csv_path}")
+
+    errors = [row["volume_error_ml"] for row in rows]
+    if errors:
+        print(f"\n📊 Volume Analysis Summary:")
+        print(f"   Mean Error: {np.mean(errors):.2f} +/- {np.std(errors):.2f} ml")
+        print(f"   Min Error: {np.min(errors):.2f} ml")
+        print(f"   Max Error: {np.max(errors):.2f} ml")
+
+
+# ============================================================
 # === TRAINING AND VALIDATION FUNCTIONS ===
 # ============================================================
 
@@ -730,7 +1197,36 @@ def _match_channels(x: torch.Tensor, desired_channels: int) -> torch.Tensor:
     return torch.cat([x, zeros], dim=1)
 
 
-def train_epoch(model, loader, optimizer, ema, mse_loss, device, epoch_idx, train_time_dependent, num_epochs, contrastive_coeff):
+def _iter_time_delta_groups(time_deltas: torch.Tensor):
+    """Yield scalar time deltas with masks for samples sharing the same delta."""
+    for delta in torch.unique(time_deltas):
+        yield delta.view(1), time_deltas == delta
+
+
+def add_random_noise(img: torch.Tensor, max_intensity: float = 0.1) -> torch.Tensor:
+    intensity = max_intensity * torch.rand(1, device=img.device, dtype=img.dtype)
+    noise = intensity * torch.randn_like(img)
+    return img + noise
+
+
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    ema,
+    mse_loss,
+    device,
+    epoch_idx,
+    train_time_dependent,
+    num_epochs,
+    contrastive_coeff,
+    smoothness_coeff=0.0,
+    latent_coeff=0.0,
+    invariance_coeff=0.0,
+    no_l2=False,
+    t_multiplier=1.0,
+    noise_max_intensity=0.1,
+):
     model.train()
 
     total_recon_loss = 0.0
@@ -742,20 +1238,23 @@ def train_epoch(model, loader, optimizer, ema, mse_loss, device, epoch_idx, trai
     for i, batch in enumerate(pbar):
         source_img, target_img = batch["source"].to(device), batch["target"].to(device)
         time_deltas = batch["time_delta"].to(device)
+        source_img_noisy = add_random_noise(source_img, max_intensity=noise_max_intensity)
+        target_img_noisy = add_random_noise(target_img, max_intensity=noise_max_intensity)
 
         optimizer.zero_grad()
 
         # Ensure target matches the channel structure used by the model.
         # ImageFlowNetODE outputs the same number of channels as its input.
         target_in = _match_channels(target_img, source_img.shape[1])
+        target_in_noisy = _match_channels(target_img_noisy, source_img.shape[1])
 
         # --- Reconstruction Loss (time-independent) ---
         if hasattr(model, 'unfreeze'):
             model.unfreeze()
             
         t0 = torch.zeros(1, device=device)
-        source_recon = model(source_img, t=t0)
-        target_recon = model(target_in, t=t0)
+        source_recon = model(source_img_noisy, t=t0)
+        target_recon = model(target_in_noisy, t=t0)
 
         loss_recon = mse_loss(source_recon, source_img) + mse_loss(target_recon, target_in)
         total_recon_loss += loss_recon.item()
@@ -783,9 +1282,23 @@ def train_epoch(model, loader, optimizer, ema, mse_loss, device, epoch_idx, trai
             if hasattr(model, 'freeze_time_independent'):
                 model.freeze_time_independent()
 
-            t = time_deltas[0:1]
-            predicted_target = model(source_img, t)
-            loss_pred = mse_loss(predicted_target, target_in) 
+            loss_pred = 0.0
+            num_pred_groups = 0
+            for t, mask in _iter_time_delta_groups(time_deltas):
+                scaled_t = t * t_multiplier
+                if smoothness_coeff > 0:
+                    predicted_target, smoothness_loss = model(source_img_noisy[mask], scaled_t, return_grad=True)
+                else:
+                    predicted_target = model(source_img_noisy[mask], scaled_t)
+                    smoothness_loss = 0.0
+
+                if no_l2:
+                    pred_group_loss = smoothness_coeff * smoothness_loss + latent_coeff * 0.0
+                else:
+                    pred_group_loss = mse_loss(predicted_target, target_in[mask]) + smoothness_coeff * smoothness_loss
+                loss_pred = loss_pred + pred_group_loss
+                num_pred_groups += 1
+            loss_pred = loss_pred / max(num_pred_groups, 1)
             
             loss_pred.backward()
             optimizer.step()
@@ -804,7 +1317,7 @@ def train_epoch(model, loader, optimizer, ema, mse_loss, device, epoch_idx, trai
     return avg_recon_loss, avg_pred_loss
 
 
-def val_epoch(model, loader, device):
+def val_epoch(model, loader, device, t_multiplier=1.0):
     model.eval()
 
     recon_psnr_metric = torchmetrics.PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -825,9 +1338,9 @@ def val_epoch(model, loader, device):
             recon_psnr_metric.update(target_recon, target_in)
 
             # Prediction PSNR
-            t = time_deltas[0:1]
-            predicted_target = model(source_img, t)
-            pred_psnr_metric.update(predicted_target, target_in)
+            for t, mask in _iter_time_delta_groups(time_deltas):
+                predicted_target = model(source_img[mask], t * t_multiplier)
+                pred_psnr_metric.update(predicted_target, target_in[mask])
 
     avg_recon_psnr = recon_psnr_metric.compute().item()
     avg_pred_psnr = pred_psnr_metric.compute().item()
@@ -1117,9 +1630,9 @@ def evaluate_and_visualize_tasks(model_path, source_loader, gt_loaders, device, 
 
     # Updated tasks for t1->t2 (interpolation), t1->t3 (training), t1->t4 (extrapolation)
     tasks = {
-        "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": 3.0},  # t1 -> t2 (Δt=3.0)
-        "Training_t3":      {"scan_pair": "Scan3Wave4", "time": 6.0},  # t1 -> t3 (Δt=6.0, trained)
-        "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": 9.0},  # t1 -> t4 (Δt=9.0)
+        "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": 1.0},  # t1 -> t2 (Δt=1.0)
+        "Training_t3":      {"scan_pair": "Scan3Wave4", "time": 2.0},  # t1 -> t3 (Δt=2.0, trained)
+        "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": 3.0},  # t1 -> t4 (Δt=3.0)
     }
     metrics = {name: {
         "psnr": torchmetrics.PeakSignalNoiseRatio(data_range=1.0).to(device),
@@ -1195,6 +1708,108 @@ def evaluate_and_visualize_tasks(model_path, source_loader, gt_loaders, device, 
             nib.save(nii_image, output_filename)
 
     final_results = {'model_path': model_path}
+    for task_name in tasks:
+        final_results[task_name] = {
+            "PSNR": metrics[task_name]["psnr"].compute().item(),
+            "SSIM": metrics[task_name]["ssim"].compute().item(),
+        }
+    return final_results
+
+
+def evaluate_and_visualize_flair_tasks(model_path, source_loader, gt_loaders, device, original_scans_dir, in_channels=1, out_channels=1, results_dir="results"):
+    """FLAIR-only evaluation using the shared year-based time deltas."""
+    print(f"\n--- Evaluating: {os.path.basename(model_path)} ---")
+
+    model = ImageFlowNetODE_FlexibleOutput(
+        device=device,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        ode_location='bottleneck',
+        contrastive=True,
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    tasks = {
+        "Interpolation_t2": {"scan_pair": "Scan2Wave3", "time": FLAIR_EVAL_TASKS["Scan2Wave3"]},
+        "Training_t3": {"scan_pair": "Scan3Wave4", "time": FLAIR_EVAL_TASKS["Scan3Wave4"]},
+        "Extrapolation_t4": {"scan_pair": "Scan4Wave5", "time": FLAIR_EVAL_TASKS["Scan4Wave5"]},
+    }
+    metrics = {
+        name: {
+            "psnr": torchmetrics.PeakSignalNoiseRatio(data_range=1.0).to(device),
+            "ssim": torchmetrics.StructuralSimilarityIndexMeasure(data_range=1.0).to(device),
+        }
+        for name in tasks
+    }
+
+    patient_predictions = {task_name: defaultdict(dict) for task_name in tasks}
+    gt_iterators = {task: iter(loader) for task, loader in gt_loaders.items()}
+
+    with torch.no_grad():
+        for i, source_batch in enumerate(tqdm(source_loader, desc="Evaluating")):
+            source_img = source_batch["source"].to(device)
+            patient_ids, slice_indices = source_batch["patient_id"], source_batch["slice_idx"]
+
+            for task_name, task_info in tasks.items():
+                try:
+                    t = torch.tensor([task_info["time"]], device=device)
+                    pred_img = model(source_img, t=t)
+
+                    gt_pair_name = task_info["scan_pair"]
+                    gt_batch = next(gt_iterators[gt_pair_name])
+                    target_img = gt_batch["target"].to(device)
+                    metrics[task_name]["psnr"].update(pred_img, target_img)
+                    metrics[task_name]["ssim"].update(pred_img, target_img)
+
+                    for j in range(pred_img.shape[0]):
+                        p_id = patient_ids[j]
+                        s_idx = slice_indices[j].item()
+                        patient_predictions[task_name][p_id][s_idx] = pred_img[j, 0].cpu().numpy()
+
+                    if i == 0:
+                        model_prefix = os.path.basename(model_path).split('.')[0]
+                        visualize_results(
+                            source=source_img,
+                            ground_truth=target_img,
+                            predicted=pred_img,
+                            patient_ids=patient_ids,
+                            slice_indices=slice_indices,
+                            filename=f"Comparison_{model_prefix}_to_{gt_pair_name}.png",
+                            save_dir=results_dir,
+                        )
+                except StopIteration:
+                    continue
+
+    print("\nSaving 3D NIfTI volumes...")
+    for task_name, predictions_by_patient in tqdm(patient_predictions.items(), desc="Saving"):
+        gt_pair_name = tasks[task_name]["scan_pair"]
+        model_prefix = os.path.basename(model_path).split('.')[0]
+        save_dir = os.path.join(results_dir, f"{model_prefix}_Pred_{gt_pair_name}_3D")
+        os.makedirs(save_dir, exist_ok=True)
+
+        for patient_id, slices in predictions_by_patient.items():
+            if not slices:
+                continue
+
+            max_slice_idx = max(slices.keys())
+            h, w = next(iter(slices.values())).shape
+            volume = np.zeros((h, w, max_slice_idx + 1), dtype=np.float32)
+            for slice_idx, slice_data in slices.items():
+                volume[:, :, slice_idx] = slice_data
+
+            affine = np.eye(4)
+            try:
+                full_prefix = f"LBC36{patient_id}"
+                original_file = next(f for f in os.listdir(original_scans_dir) if f.startswith(full_prefix))
+                original_nii = nib.load(os.path.join(original_scans_dir, original_file))
+                affine = original_nii.affine
+            except Exception:
+                pass
+
+            nib.save(nib.Nifti1Image(volume, affine), os.path.join(save_dir, f"{patient_id}_predicted_3D.nii.gz"))
+
+    final_results = {"model_path": model_path}
     for task_name in tasks:
         final_results[task_name] = {
             "PSNR": metrics[task_name]["psnr"].compute().item(),

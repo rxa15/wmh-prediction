@@ -6,7 +6,7 @@ This script provides a unified interface to run different experiments via comman
 All experiments follow the same pipeline with cross-validation.
 
 Usage:
-    python main.py --exp 1  # Run Experiment 1: FLAIR ? FLAIR (two-stage, loss: L1 only)
+    python main.py --exp 1  # Run Experiment BL: FLAIR ? FLAIR baseline
     python main.py --exp 2  # Run Experiment 2: FLAIR ? FLAIR (two-stage, loss: L1 + SSIM)
     python main.py --exp 3  # Run Experiment 3: FLAIR ? FLAIR (dense-pairs, loss: L1)
     python main.py --exp 4 # Run Experiment 4: FLAIR ? FLAIR (dense-pairs, loss: L1 + SSIM)
@@ -17,7 +17,7 @@ Usage:
     python main.py --exp 9 # Run Experiment 9: FLAIR ? FLAIR (UNet baseline)
     
 Available Experiments:
-    1: FLAIR ? FLAIR (two-stage: prediction then segmentation, loss: L1 only)
+    1: FLAIR ? FLAIR baseline
     2: FLAIR ? FLAIR (two-stage: prediction then segmentation, loss: L1 + SSIM)
     3: FLAIR ? FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1)
     4: FLAIR ? FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1 + SSIM)
@@ -54,73 +54,25 @@ print(f"   - TF32 enabled: {torch.backends.cuda.matmul.allow_tf32}")
 print(f"   - cuDNN benchmark: {torch.backends.cudnn.benchmark}")
 
 # Import experiments directly (same folder)
-from base import BaseExperiment
-from flair_to_flair import Experiment1
-from flair_to_flair_contrastive import Experiment2
-from flair_to_flair_dense_pairs_L1 import Experiment3
-from flair_to_flair_dense_pairs_L1_SSIM import Experiment4
-from flair_wmh_to_flair import Experiment5
-from flair_wmh_to_flair_contrastive import Experiment6
-from flair_wmh_to_flair_dense_pairs_L1 import Experiment7   
-from flair_wmh_to_flair_dense_pairs_L1_SSIM import Experiment8
+# from base import BaseExperiment
+from flair_to_flair import ExperimentBL
+# from flair_to_flair_contrastive import Experiment2
+# from flair_to_flair_dense_pairs_L1 import Experiment3
+# from flair_to_flair_dense_pairs_L1_SSIM import Experiment4
+# from flair_wmh_to_flair import Experiment5
+# from flair_wmh_to_flair_contrastive import Experiment6
+# from flair_wmh_to_flair_dense_pairs_L1 import Experiment7   
+# from flair_wmh_to_flair_dense_pairs_L1_SSIM import Experiment8
 # from flair_to_flair_unet_baseline import Experiment9
 
 # Registry of available experiments
 EXPERIMENTS = {
     1: {
-        "name": "flair_to_flair_baseline",
+        "name": "flair_to_flair_bl",
+        "description": "FLAIR -> FLAIR baseline",
         "use_wmh": True,
-        "description": "FLAIR -> FLAIR (two-stairsge: prediction then segmentation, loss: L1 only)",
-        "class": Experiment1
+        "class": ExperimentBL,
     },
-    2: {
-        "name": "flair_to_flair_contrastive",
-        "use_wmh": True,
-        "description": "FLAIR -> FLAIR (two-stage: prediction then segmentation, loss: L1 + SSIM)",
-        "class": Experiment2
-    },
-    3: {
-        "name": "flair_to_flair_dense_pairs_L1",
-        "use_wmh": True,
-        "description": "FLAIR -> FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1)",
-        "class": Experiment3
-    },
-    4: {
-        "name": "flair_to_flair_dense_pairs_L1_SSIM",
-        "use_wmh": True,
-        "description": "FLAIR -> FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1 + SSIM)",
-        "class": Experiment4
-    },
-    5: {
-        "name": "flair_wmh_to_flair_baseline",
-        "use_wmh": True,
-        "description": "FLAIR + WMH -> FLAIR prediction with downstream WMH segmentation (loss: L1)",
-        "class": Experiment5
-    },
-    6: {
-        "name": "flair_wmh_to_flair_contrastive",
-        "use_wmh": True,
-        "description": "FLAIR + WMH -> FLAIR prediction with downstream WMH segmentation (loss: L1 + SSIM)",
-        "class": Experiment6
-    },
-    7: {
-        "name": "flair_wmh_to_flair_dense_pairs_L1",
-        "use_wmh": True,
-        "description": "FLAIR + WMH -> FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1)",
-        "class": Experiment7
-    },
-    8: {
-        "name": "flair_wmh_to_flair_dense_pairs_L1_SSIM",
-        "use_wmh": True,
-        "description": "FLAIR + WMH -> FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1 + SSIM)",
-        "class": Experiment8
-    },
-    # 9: {
-    #     "name": "flair_to_flair_unet_baseline",
-    #     "use_wmh": True,
-    #     "description": "FLAIR -> FLAIR (UNet baseline)",
-    #     "class": Experiment9
-    # },
 }
 
 # ============================================================
@@ -129,10 +81,11 @@ EXPERIMENTS = {
 
 CONFIG = {
     # Dataset
-    # "ROOT_DIR": "/app/dataset/LBC1936",
-    "ROOT_DIR": "/disk/febrian/Edinburgh_Data/LBC1936",
+    "ROOT_DIR": "/app/dataset/LBC1936",
+    # "ROOT_DIR": "/disk/febrian/Edinburgh_Data/LBC1936",
     "FOLD_CSV": "4fold_split.csv",  # ✅ Stratified 4-fold split
     "SCAN_NAME_STAGE2": "Scan1Wave2",
+    "SWINUNETR_MODELS_DIR": "swinunetr_models",  # Directory for pretrained SwinUNETR models
     
     # Training - MEMORY OPTIMIZED SETTINGS
     "BATCH_SIZE": 4,  # ⬇️ Reduced from 16 to 4 to save memory
@@ -144,10 +97,17 @@ CONFIG = {
     # Thresholds and coefficients
     "RECON_PSNR_THR": 40.0,
     "CONTRASTIVE_COEFF": 0.1,
+    "SMOOTHNESS_COEFF": 0.0,
+    "LATENT_COEFF": 0.0,
+    "INVARIANCE_COEFF": 0.0,
+    "NO_L2": False,
+    "NOISE_MAX_INTENSITY": 0.1,
+    "ODE_MAX_T": 9.0,
     "SEG_LOSS_WEIGHT": 1.0,  # Weight for segmentation loss (Experiment 3)
     
     # Cross-validation - 4 folds for stratified split
     "CV_FOLDS": [1, 2, 3, 4],  # ✅ Changed from 5 folds to 4 folds
+    "VAL_OFFSET": 1,  # Validation fold offset from test fold
 
     "FOLDS_TO_RUN": [1, 2, 3, 4],  # ✅ Changed from 5 folds to 4 folds
 
@@ -170,7 +130,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Available Experiments:
-  1: FLAIR ? FLAIR (two-stage, loss: L1 only)
+  1: FLAIR ? FLAIR baseline
   2: FLAIR ? FLAIR (two-stage, loss: L1 + SSIM)
   3: FLAIR ? FLAIR (dense-pairs, loss: L1)
   4: FLAIR ? FLAIR (dense-pairs, loss: L1 + SSIM)
@@ -181,7 +141,7 @@ Available Experiments:
   9: FLAIR ? FLAIR (UNet baseline)
 
 Examples:
-  python main.py --exp 1    # Run Experiment 1
+  python main.py --exp 1    # Run Experiment BL
   python main.py --exp 2    # Run Experiment 2
   python main.py --exp 3    # Run Experiment 3
   python main.py --exp 4    # Run Experiment 4
@@ -196,8 +156,8 @@ Examples:
         '--exp',
         type=int,
         required=True,
-        choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
-        help='Experiment number to run (1, 2, 3, 4, 5, 6, 7, 8, or 9)'
+        choices=sorted(EXPERIMENTS.keys()),
+        help='Experiment number to run'
     )
     return parser.parse_args()
 
