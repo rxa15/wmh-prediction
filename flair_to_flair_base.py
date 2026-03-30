@@ -46,6 +46,29 @@ class BaseFlairToFlairExperiment(BaseExperiment):
             t_multiplier=self.config.get("T_MULTIPLIER", 1.0),
         )
 
+    def _get_stage1_time_deltas(self, dataset=None):
+        """Return the time deltas used by Stage 1 training."""
+        if self.training_pairs:
+            return [float(time_delta) for _, _, time_delta in self.training_pairs]
+
+        if dataset is not None:
+            deltas = {
+                float(item["time_delta"])
+                for item in getattr(dataset, "index_map", [])
+                if "time_delta" in item
+            }
+            if deltas:
+                return sorted(deltas)
+
+        return []
+
+    def _get_stage1_max_time_delta(self, dataset=None):
+        """Return the maximum Stage 1 time delta."""
+        time_deltas = self._get_stage1_time_deltas(dataset=dataset)
+        if time_deltas:
+            return max(time_deltas)
+        return float(self.config.get("ODE_MAX_T", 1.0))
+
     def _create_stage1_dataset(self):
         use_wmh = self.use_wmh_for_stage1_dataset
         if use_wmh is None:

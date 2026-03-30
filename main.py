@@ -88,7 +88,7 @@ CONFIG = {
     "SWINUNETR_MODELS_DIR": "swinunetr_models",  # Directory for pretrained SwinUNETR models
     
     # Training - MEMORY OPTIMIZED SETTINGS
-    "BATCH_SIZE": 4,  # ⬇️ Reduced from 16 to 4 to save memory
+    "BATCH_SIZE": 24,  # ⬇️ Reduced from 16 to 4 to save memory
     "LEARNING_RATE": 1e-4,
     "NUM_EPOCHS": 50,
     "MAX_SLICES": 48,

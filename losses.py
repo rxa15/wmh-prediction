@@ -37,10 +37,11 @@ def ssim(pred, target, window_size=11, data_range=1.0):
     C1 = (0.01 * data_range) ** 2
     C2 = (0.03 * data_range) ** 2
 
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    eps = 1e-6
+    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (denominator + eps)
 
-    return ssim_map.mean()
+    return torch.clamp(ssim_map.mean(), 0, 1)
 
 class L1SSIMLoss(nn.Module):
     def __init__(self, alpha=0.5, window_size=11):

@@ -29,7 +29,7 @@ torch.cuda.empty_cache()
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from ImageFlowNet.src.nn.imageflownet_ode import ImageFlowNetODE
+from ImageFlowNet.src.nn.imageflownet_ode import ImageFlowNetODE_FlexibleOutput
 
 
 class ExperimentBL(BaseFlairToFlairExperiment):
@@ -37,7 +37,7 @@ class ExperimentBL(BaseFlairToFlairExperiment):
     Experiment BL: FLAIR → FLAIR prediction with downstream WMH segmentation.
     
     Methodological Design:
-    - Uses only L1 loss for FLAIR prediction
+    - Uses loss from ImageFlowNet for FLAIR prediction
     - WMH segmentation is performed as a downstream evaluation task
     - use_wmh=True: WMH masks used ONLY for filtering slices with lesions
     - Model inputs/outputs: FLAIR-only (C=1) - no WMH channel in training
@@ -48,14 +48,16 @@ class ExperimentBL(BaseFlairToFlairExperiment):
     
     require_wmh_presence = False
     use_wmh_for_stage1_dataset = False
+    training_pairs = None
     stage1_max_slices_per_patient = 12
     stage1_dataset_kwargs = {
         "slice_selection_mode": "random_valid",
         "valid_slice_mode": "wmh",
         "random_seed": 42,
+        "transform": True,
     }
-    run_title = "FLAIR → FLAIR (L1 only)"
-    
+    run_title = "FLAIR → FLAIR (ImageFlowNet only loss)"
+
     # def _diagnose_wmh(self, dataset):
     #     print("\n================ WMH DIAGNOSTIC ================")
 
@@ -114,7 +116,7 @@ class ExperimentBL(BaseFlairToFlairExperiment):
         print("✅ STAGE 1: ImageFlowNet Training")
         print("="*60)
         
-        print("Initializing dataset with custom training pairs (all temporal pairs)...")
+        print("Initializing dataset with automatic temporal pair generation...")
         full_dataset = self._create_stage1_dataset()
         folds_dict = self._load_folds_dict()
         
@@ -169,9 +171,10 @@ class ExperimentBL(BaseFlairToFlairExperiment):
         )
         
         # Initialize model
-        model = ImageFlowNetODE(
+        model = ImageFlowNetODE_FlexibleOutput(
             device=self.config["DEVICE"],
             in_channels=1,
+            out_channels=1,
             ode_location='bottleneck',
             contrastive=True
         ).to(self.config["DEVICE"])
@@ -184,7 +187,7 @@ class ExperimentBL(BaseFlairToFlairExperiment):
         )
         ema = ExponentialMovingAverage(model.parameters(), decay=0.9)
         recon_loss = nn.MSELoss()
-        max_time_delta = max(time_delta for _, _, time_delta in self.training_pairs)
+        max_time_delta = self._get_stage1_max_time_delta(dataset=full_dataset)
         t_multiplier = self.config.get("ODE_MAX_T", max_time_delta) / max_time_delta
         self.config["T_MULTIPLIER"] = t_multiplier
         
@@ -458,9 +461,10 @@ class ExperimentBL(BaseFlairToFlairExperiment):
         """Evaluate an ensemble of Stage 1 models with downstream WMH segmentation."""
         models = []
         for model_path in model_paths:
-            model = ImageFlowNetODE(
+            model = ImageFlowNetODE_FlexibleOutput(
                 device=self.config["DEVICE"],
                 in_channels=1,
+                out_channels=1,
                 ode_location='bottleneck',
                 contrastive=True,
             ).to(self.config["DEVICE"])

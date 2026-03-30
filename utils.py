@@ -6,7 +6,10 @@ Common utilities, classes, and functions shared across all experiments.
 import os
 import re
 import sys
+import gc
+import json
 from collections import defaultdict
+from xml.parsers.expat import model
 
 import matplotlib.pyplot as plt
 import nibabel as nib
@@ -34,112 +37,7 @@ from monai.networks.nets import SwinUNETR
 
 import torch
 from torch import nn
-
-class ImageFlowNetODE_FlexibleOutput(ImageFlowNetODE):
-    """
-    Subclass of ImageFlowNetODE that allows explicit control over the output
-    channel count via a final 1x1 convolution layer.
-    """
-    def __init__(self,
-                 device: torch.device,
-                 in_channels: int,
-                 out_channels: int,
-                 ode_location: str = 'all_connections',
-                 contrastive: bool = False,
-                 **kwargs):
-
-        # Determine native output channels based on the input channels for the parent class's init
-        # We assume UNet output matches input channels if not specified.
-        # This parameter is now called out_channels_native in the parent class to avoid collision.
-        native_output_channels = in_channels
-
-        # 1. Initialize the parent class (which creates the UNet and ODE blocks)
-        super().__init__(
-            device=device,
-            in_channels=in_channels,
-            out_channels_native=native_output_channels,
-            ode_location=ode_location,
-            contrastive=contrastive,
-            **kwargs
-        )
-
-        self.out_channels_desired = out_channels
-
-        # 2. Add the custom final output conversion layer
-        if native_output_channels != self.out_channels_desired:
-            self.final_output_conv = torch.nn.Conv2d(
-                in_channels=native_output_channels,
-                out_channels=self.out_channels_desired,
-                kernel_size=1
-            )
-        else:
-            self.final_output_conv = torch.nn.Identity()
-
-        self.final_output_conv.to(self.device)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, return_grad: bool = False):
-        """
-        Overrides the forward pass to apply the custom output conversion layer.
-        """
-        # 1. Get the native output from the parent class's forward method.
-        # We can't directly call super().forward() because it finishes the computation.
-        # We need to reimplement the parent forward up to the point of unet.out(h)
-        # but stop right before the final unet.out(h) to intercept the output.
-        # Since the forward is large, a clean re-implementation is the only way here.
-
-        use_ode = t.item() != 0
-        if use_ode:
-            integration_time = torch.tensor([0, t.item()]).float().to(t.device)
-
-        dummy_t = torch.zeros_like(t).to(t.device)
-        emb = self.unet.time_embed(timestep_embedding(dummy_t, self.unet.model_channels))
-
-        h = x.type(self.unet.dtype)
-
-        # Contraction path.
-        h_skip_connection = []
-        for module in self.unet.input_blocks:
-            h = module(h, emb)
-            h_skip_connection.append(h)
-
-        # Bottleneck
-        h = self.unet.middle_block(h, emb)
-
-        # ODE on bottleneck
-        if use_ode:
-            h = self.ode_list[-1](h, integration_time)
-
-        # Expansion path.
-        for module_idx, module in enumerate(self.unet.output_blocks):
-            h_skip = h_skip_connection.pop(-1)
-
-            # ODE over skip connections.
-            if use_ode and self.ode_location in ['all_resolutions', 'all_connections']:
-                if self.ode_location == 'all_connections':
-                    curr_ode_block = self.ode_list[::-1][module_idx + 1]
-                else:
-                    resolution_idx = np.argwhere(np.unique(self.dim_list) == h_skip.shape[1]).item()
-                    curr_ode_block = self.ode_list[resolution_idx]
-                h_skip = curr_ode_block(h_skip, integration_time)
-
-            h = torch.cat([h, h_skip], dim=1)
-            h = module(h, emb)
-
-        # UNet's Native Output
-        h = h.type(x.dtype)
-        unet_native_output = self.unet.out(h)
-
-        # 2. Apply the custom output conversion
-        output = self.final_output_conv(unet_native_output)
-
-        if return_grad:
-            vec_field_gradients = 0
-            for i in range(len(self.ode_list)):
-                vec_field_gradients += self.ode_list[i].vec_grad()
-            return output, vec_field_gradients.mean() / len(self.ode_list)
-        else:
-            return output
-
+    
 class BinaryDice(nn.Module):
     """
     Drop-in replacement for torchmetrics.classification.BinaryDice.
@@ -416,6 +314,32 @@ class FLAIREvolutionDataset(Dataset):
         self.index_map = []
         self.patient_ids = set()
         self._vol_minmax_cache = {}
+        self._volume_cache = {}
+        self._volume_shape_cache = {}
+        self._wmh_index_cache = {}
+        self._wmh_index_cache_path = os.path.join(self.root_dir, "wmh_slice_indices_cache.json")
+        self._wmh_index_cache_dirty = False
+        self._sample_cache = None
+
+        self.transform = transform
+
+        if self.transform:
+            from monai.transforms import Compose, RandFlip, RandAffine
+
+            self.augment = Compose([
+                RandFlip(prob=0.5, spatial_axis=0),
+                RandFlip(prob=0.5, spatial_axis=1),
+                RandAffine(
+                    prob=0.3,
+                    rotate_range=(0.1,),
+                    scale_range=(0.1, 0.1),
+                    translate_range=(10, 10),
+                ),
+            ])
+        else:
+            self.augment = None
+
+        self._load_wmh_index_cache()
 
         print(f"📂 Scanning folders in {root_dir} ...")
 
@@ -484,17 +408,25 @@ class FLAIREvolutionDataset(Dataset):
 
         # Step 3: Create training pairs
         if training_pairs is None:
-            # Default: Load all consecutive pairs
+            print("Generating temporal scan pairs from available longitudinal visits...")
             for patient_id, scans in patient_scans.items():
-                for scan_pair in scans:
-                    match = re.match(r"Scan(\d+)Wave(\d+)", scan_pair)
-                    if not match:
-                        continue
-                    scan_idx, wave_idx = map(float, match.groups())
-                    time_delta = wave_idx - scan_idx
+                ordered_scans = sorted(scans.keys(), key=self._scan_sort_key)
+                for source_idx in range(len(ordered_scans)):
+                    for target_idx in range(source_idx + 1, len(ordered_scans)):
+                        source_scan = ordered_scans[source_idx]
+                        target_scan = ordered_scans[target_idx]
+                        time_delta = self._resolve_time_delta(source_scan, target_scan)
+                        if time_delta is None:
+                            continue
 
-                    self._add_scan_pair(scans[scan_pair], scans[scan_pair],
-                                       patient_id, scan_pair, time_delta, max_slices_per_patient)
+                        self._add_scan_pair(
+                            scans[source_scan],
+                            scans[target_scan],
+                            patient_id,
+                            f"{source_scan}_to_{target_scan}",
+                            time_delta,
+                            max_slices_per_patient,
+                        )
         else:
             # Custom training pairs (e.g., t1->t3)
             print(f"🎯 Using custom training pairs: {training_pairs}")
@@ -506,41 +438,74 @@ class FLAIREvolutionDataset(Dataset):
                                            time_delta, max_slices_per_patient)
         print(f"📊 Dataset ready. Found {len(self.index_map)} slices from {len(self.patient_ids)} patients.")
         print(f"🔧 Configuration: use_wmh = {self.use_wmh}")
+        self._save_wmh_index_cache()
+
+    def _scan_sort_key(self, scan_name):
+        """Sort scans by wave number first, then scan number as a fallback."""
+        match = re.match(r"Scan(\d+)Wave(\d+)", scan_name)
+        if not match:
+            return (float("inf"), float("inf"), scan_name)
+
+        scan_idx, wave_idx = match.groups()
+        return (int(wave_idx), int(scan_idx), scan_name)
+
+    def _resolve_time_delta(self, source_scan, target_scan):
+        """Resolve a temporal gap for automatically discovered scan pairs."""
+        for pair_source, pair_target, time_delta in ALL_FLAIR_TEMPORAL_PAIRS:
+            if pair_source == source_scan and pair_target == target_scan:
+                return float(time_delta)
+
+        source_match = re.search(r"Wave(\d+)", source_scan)
+        target_match = re.search(r"Wave(\d+)", target_scan)
+        if source_match and target_match:
+            return float(int(target_match.group(1)) - int(source_match.group(1)))
+
+        return None
 
     def _add_scan_pair(self, source_info, target_info, patient_id, scan_pair, time_delta, max_slices_per_patient):
         """Add a source->target scan pair to the dataset."""
         try:
-            source_vol = nib.load(source_info["flair_path"]).get_fdata(dtype=np.float32)
-            target_vol = nib.load(target_info["flair_path"]).get_fdata(dtype=np.float32)
-
             source_wmh_vol = None
+            source_wmh_indices = set()
             if source_info.get("wmh_path"):
                 try:
-                    source_wmh_vol = nib.load(source_info["wmh_path"]).get_fdata(dtype=np.float32)
+                    source_wmh_vol = self._get_volume(source_info["wmh_path"])
+                    source_wmh_indices = self._get_wmh_slice_indices_for_path(source_info["wmh_path"])
                 except Exception as e:
                     print(f"Could not load source WMH for filtering: {e}")
 
             target_wmh_vol = None
+            target_wmh_indices = set()
             if target_info.get("wmh_path"):
                 try:
-                    target_wmh_vol = nib.load(target_info["wmh_path"]).get_fdata(dtype=np.float32)
+                    target_wmh_vol = self._get_volume(target_info["wmh_path"])
+                    target_wmh_indices = self._get_wmh_slice_indices_for_path(target_info["wmh_path"])
                 except Exception as e:
                     print(f"Could not load target WMH for filtering: {e}")
 
-            num_slices = min(source_vol.shape[2], target_vol.shape[2])
+            source_shape = self._get_volume_shape(source_info["flair_path"])
+            target_shape = self._get_volume_shape(target_info["flair_path"])
+            num_slices = min(source_shape[self.slice_axis], target_shape[self.slice_axis])
             if source_wmh_vol is not None:
-                num_slices = min(num_slices, source_wmh_vol.shape[2])
+                num_slices = min(num_slices, source_wmh_vol.shape[self.slice_axis])
             if target_wmh_vol is not None:
-                num_slices = min(num_slices, target_wmh_vol.shape[2])
+                num_slices = min(num_slices, target_wmh_vol.shape[self.slice_axis])
 
+            source_vol = None
+            target_vol = None
             valid_slice_indices = self._compute_valid_slice_indices(
-                source_vol=source_vol[:, :, :num_slices],
-                target_vol=target_vol[:, :, :num_slices],
-                source_wmh_vol=source_wmh_vol[:, :, :num_slices] if source_wmh_vol is not None else None,
-                target_wmh_vol=target_wmh_vol[:, :, :num_slices] if target_wmh_vol is not None else None,
+                source_vol=source_vol,
+                target_vol=target_vol,
+                source_wmh_vol=np.take(source_wmh_vol, indices=range(num_slices), axis=self.slice_axis) if source_wmh_vol is not None else None,
+                target_wmh_vol=np.take(target_wmh_vol, indices=range(num_slices), axis=self.slice_axis) if target_wmh_vol is not None else None,
                 patient_id=patient_id,
                 scan_pair=scan_pair,
                 max_slices_per_patient=max_slices_per_patient,
+                num_slices=num_slices,
+                source_flair_path=source_info["flair_path"],
+                target_flair_path=target_info["flair_path"],
+                source_wmh_indices=source_wmh_indices,
+                target_wmh_indices=target_wmh_indices,
             )
 
             for s_idx in valid_slice_indices:
@@ -584,10 +549,60 @@ class FLAIREvolutionDataset(Dataset):
 
         for slice_idx in range(num_slices):
             slice_data = np.take(volume, slice_idx, axis=self.slice_axis)
-            if (slice_data > 0).any():
+            if np.max(slice_data) > 0:
                 valid_indices.add(slice_idx)
 
         return valid_indices
+
+    def _get_wmh_slice_indices_for_path(self, file_path):
+        """Return cached WMH-positive slice indices for a mask volume path."""
+        if not file_path:
+            return set()
+        if file_path not in self._wmh_index_cache:
+            volume = self._get_volume(file_path)
+            self._wmh_index_cache[file_path] = sorted(self._get_wmh_slice_indices(volume))
+            self._wmh_index_cache_dirty = True
+        return set(self._wmh_index_cache[file_path])
+
+    def _load_wmh_index_cache(self):
+        """Load persistent WMH-positive slice indices from disk if available."""
+        if not os.path.exists(self._wmh_index_cache_path):
+            return
+
+        try:
+            with open(self._wmh_index_cache_path, "r", encoding="utf-8") as f:
+                raw_cache = json.load(f)
+
+            normalized_cache = {}
+            for file_path, indices in raw_cache.items():
+                if not isinstance(indices, list):
+                    continue
+                normalized_cache[file_path] = sorted(
+                    int(idx) for idx in indices if isinstance(idx, (int, float)) or str(idx).isdigit()
+                )
+
+            self._wmh_index_cache.update(normalized_cache)
+            print(f"Loaded WMH slice cache from {self._wmh_index_cache_path}")
+        except Exception as e:
+            print(f"Could not load WMH slice cache: {e}")
+
+    def _save_wmh_index_cache(self):
+        """Persist WMH-positive slice indices for reuse across runs."""
+        if not self._wmh_index_cache_dirty:
+            return
+
+        try:
+            with open(self._wmh_index_cache_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {path: sorted(int(idx) for idx in indices) for path, indices in self._wmh_index_cache.items()},
+                    f,
+                    indent=2,
+                    sort_keys=True,
+                )
+            self._wmh_index_cache_dirty = False
+            print(f"Saved WMH slice cache to {self._wmh_index_cache_path}")
+        except Exception as e:
+            print(f"Could not save WMH slice cache: {e}")
 
     def _select_slice_subset(self, slice_indices, max_slices_per_patient, patient_id, scan_pair):
         if not slice_indices:
@@ -615,10 +630,24 @@ class FLAIREvolutionDataset(Dataset):
         patient_id,
         scan_pair,
         max_slices_per_patient,
+        num_slices,
+        source_flair_path=None,
+        target_flair_path=None,
+        source_wmh_indices=None,
+        target_wmh_indices=None,
     ):
-        all_slice_indices = list(range(source_vol.shape[self.slice_axis]))
-        brain_slices = self._get_foreground_slice_indices(source_vol) | self._get_foreground_slice_indices(target_vol)
-        wmh_slices = self._get_wmh_slice_indices(target_wmh_vol) | self._get_wmh_slice_indices(source_wmh_vol)
+        all_slice_indices = list(range(num_slices))
+        if source_wmh_indices is None:
+            source_wmh_indices = self._get_wmh_slice_indices(source_wmh_vol)
+        else:
+            source_wmh_indices = {idx for idx in source_wmh_indices if idx < num_slices}
+
+        if target_wmh_indices is None:
+            target_wmh_indices = self._get_wmh_slice_indices(target_wmh_vol)
+        else:
+            target_wmh_indices = {idx for idx in target_wmh_indices if idx < num_slices}
+
+        wmh_slices = target_wmh_indices | source_wmh_indices
 
         mode_aliases = {
             "brain": "brain",
@@ -639,12 +668,23 @@ class FLAIREvolutionDataset(Dataset):
         if self.require_wmh_presence:
             mode = "wmh"
 
-        if mode == "brain":
-            valid_slice_indices = sorted(brain_slices)
-        elif mode == "brain_or_wmh":
-            valid_slice_indices = sorted(brain_slices | wmh_slices)
-        else:
+        brain_slices = set()
+        if mode == "wmh" and wmh_slices:
             valid_slice_indices = sorted(wmh_slices)
+        else:
+            if source_vol is None and source_flair_path is not None:
+                source_vol = self._get_volume(source_flair_path)[:, :, :num_slices]
+            if target_vol is None and target_flair_path is not None:
+                target_vol = self._get_volume(target_flair_path)[:, :, :num_slices]
+
+            brain_slices = self._get_foreground_slice_indices(source_vol) | self._get_foreground_slice_indices(target_vol)
+
+            if mode == "brain":
+                valid_slice_indices = sorted(brain_slices)
+            elif mode == "brain_or_wmh":
+                valid_slice_indices = sorted(brain_slices | wmh_slices)
+            else:
+                valid_slice_indices = sorted(wmh_slices)
 
         if not valid_slice_indices:
             valid_slice_indices = sorted(brain_slices)
@@ -659,24 +699,31 @@ class FLAIREvolutionDataset(Dataset):
             scan_pair=scan_pair,
         )
 
+    def _get_volume(self, file_path):
+        """Load a 3D volume once and reuse it across indexing/preload steps."""
+        if file_path not in self._volume_cache:
+            self._volume_cache[file_path] = nib.load(file_path).get_fdata(dtype=np.float32)
+        return self._volume_cache[file_path]
+
+    def _get_volume_shape(self, file_path):
+        """Return a volume shape from the NIfTI header without loading full voxel data."""
+        if file_path not in self._volume_shape_cache:
+            self._volume_shape_cache[file_path] = nib.load(file_path).shape
+        return self._volume_shape_cache[file_path]
+
     def _get_volume_minmax(self, file_path):
         """Return (vmin, vmax) for a 3D volume, cached per file path."""
         if file_path in self._vol_minmax_cache:
             return self._vol_minmax_cache[file_path]
-        vol = nib.load(file_path).get_fdata(dtype=np.float32)
+        vol = self._get_volume(file_path)
         vmin = float(np.min(vol))
         vmax = float(np.max(vol))
         self._vol_minmax_cache[file_path] = (vmin, vmax)
         return vmin, vmax
 
     def _load_slice(self, file_path, slice_idx, vmin=None, vmax=None):
-        img = nib.load(file_path)
-        img_slice = np.asanyarray(np.take(img.dataobj, slice_idx, axis=self.slice_axis), dtype=np.float32)
-        
-        # Check for NaN/Inf in loaded data
-        if np.isnan(img_slice).any() or np.isinf(img_slice).any():
-            print(f"⚠️  WARNING: NaN/Inf detected in {file_path}, slice {slice_idx}")
-            img_slice = np.nan_to_num(img_slice, nan=0.0, posinf=0.0, neginf=0.0)
+        vol = self._get_volume(file_path)
+        img_slice = np.asanyarray(np.take(vol, slice_idx, axis=self.slice_axis), dtype=np.float32)
         
         if vmin is not None and vmax is not None:
             denom = (vmax - vmin)
@@ -694,45 +741,82 @@ class FLAIREvolutionDataset(Dataset):
             else:
                 # Constant slice - set to 0
                 img_slice = np.zeros_like(img_slice)
-        
+
         return torch.from_numpy(img_slice).unsqueeze(0)
 
-    def __len__(self):
-        return len(self.index_map)
-
-    def __getitem__(self, idx):
-        info = self.index_map[idx]
-
+    def _build_sample(self, info):
         slice_idx = info["slice_idx"]
+
+        # --- Load normalized slices ---
         s_vmin, s_vmax = self._get_volume_minmax(info["source_flair_path"])
         t_vmin, t_vmax = self._get_volume_minmax(info["target_flair_path"])
 
-        # Load source image
-        source_flair = self._load_slice(info["source_flair_path"], slice_idx, vmin=s_vmin, vmax=s_vmax)
-        if self.use_wmh and info["source_wmh_path"]:
-            source_wmh = self._load_slice(info["source_wmh_path"], info["slice_idx"])
-            source_img = torch.cat([source_flair, source_wmh], dim=0)
-        else:
-            source_img = source_flair
+        source_flair = self._load_slice(
+            info["source_flair_path"], slice_idx, vmin=s_vmin, vmax=s_vmax
+        )
 
-        # Load target image
-        target_flair = self._load_slice(info["target_flair_path"], slice_idx, vmin=t_vmin, vmax=t_vmax)
-        if self.use_wmh and info["target_wmh_path"]:
-            target_wmh = self._load_slice(info["target_wmh_path"], info["slice_idx"])
+        target_flair = self._load_slice(
+            info["target_flair_path"], slice_idx, vmin=t_vmin, vmax=t_vmax
+        )
+
+        # --- Handle WMH channels ---
+        if self.use_wmh:
+            if info["source_wmh_path"]:
+                source_wmh = self._load_slice(info["source_wmh_path"], slice_idx)
+            else:
+                source_wmh = torch.zeros_like(source_flair)
+
+            if info["target_wmh_path"]:
+                target_wmh = self._load_slice(info["target_wmh_path"], slice_idx)
+            else:
+                target_wmh = torch.zeros_like(target_flair)
+
+            source_img = torch.cat([source_flair, source_wmh], dim=0)
+
             if self.use_flair_output:
                 target_img = torch.cat([target_flair, target_wmh], dim=0)
             else:
                 target_img = target_wmh
         else:
+            source_img = source_flair
             target_img = target_flair
+
+        # =========================================================
+        # --- Apply identical random augmentations to source and target ---
+        # =========================================================
+        if self.augment is not None:
+            seed = np.random.randint(0, 1e9)
+
+            self.augment.set_random_state(seed)
+            source_img = self.augment(source_img)
+
+            self.augment.set_random_state(seed)
+            target_img = self.augment(target_img)
 
         return {
             "source": source_img,
             "target": target_img,
             "time_delta": torch.tensor(info["time_delta"], dtype=torch.float32),
             "patient_id": info["patient_id"],
-            "slice_idx": torch.tensor(info["slice_idx"], dtype=torch.long)
+            "slice_idx": torch.tensor(slice_idx, dtype=torch.long),
         }
+
+    def _preload_all_samples(self):
+        print(f"🚚 Preloading {len(self.index_map)} samples into memory...")
+        self._sample_cache = [self._build_sample(info) for info in tqdm(self.index_map, desc="Preloading dataset")]
+        self._volume_cache.clear()
+        gc.collect()
+        print("✅ Dataset samples cached in memory.")
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        if self._sample_cache is not None:
+            return self._sample_cache[idx]
+
+        info = self.index_map[idx]
+        return self._build_sample(info)
 
 
 class DownstreamSegmentationDataset(Dataset):
@@ -866,10 +950,12 @@ def compute_prediction_ssim(model, loader, device, t_multiplier=1.0):
             source_img = batch["source"].to(device)
             target_img = batch["target"].to(device)
             time_deltas = batch["time_delta"].to(device)
+            target_in = _match_channels(target_img, source_img.shape[1])
 
             for t, mask in _iter_time_delta_groups(time_deltas):
                 predicted_target = model(source_img[mask], t * t_multiplier)
-                ssim_metric.update(predicted_target, target_img[mask])
+                predicted_target = _match_channels(predicted_target, target_in[mask].shape[1])
+                ssim_metric.update(predicted_target, target_in[mask])
 
     return ssim_metric.compute().item()
 
@@ -1234,72 +1320,140 @@ def train_epoch(
     pred_loss_count = 0
     recon_loss_count = 0 
 
+    def augment(x):
+        noise = torch.randn_like(x) * 0.05
+        return torch.clamp(x + noise, 0, 1)
+
     pbar = tqdm(loader, desc=f"Epoch {epoch_idx+1}/{num_epochs} [Train]")
+
     for i, batch in enumerate(pbar):
-        source_img, target_img = batch["source"].to(device), batch["target"].to(device)
+        source_img = batch["source"].to(device)
+        target_img = batch["target"].to(device)
         time_deltas = batch["time_delta"].to(device)
+
         source_img_noisy = add_random_noise(source_img, max_intensity=noise_max_intensity)
         target_img_noisy = add_random_noise(target_img, max_intensity=noise_max_intensity)
 
         optimizer.zero_grad()
 
-        # Ensure target matches the channel structure used by the model.
-        # ImageFlowNetODE outputs the same number of channels as its input.
         target_in = _match_channels(target_img, source_img.shape[1])
         target_in_noisy = _match_channels(target_img_noisy, source_img.shape[1])
 
-        # --- Reconstruction Loss (time-independent) ---
+        # =========================================================
+        # === RECONSTRUCTION PHASE ================================
+        # =========================================================
         if hasattr(model, 'unfreeze'):
             model.unfreeze()
-            
+
         t0 = torch.zeros(1, device=device)
+
         source_recon = model(source_img_noisy, t=t0)
         target_recon = model(target_in_noisy, t=t0)
+        source_recon = _match_channels(source_recon, source_img.shape[1])
+        target_recon = _match_channels(target_recon, target_in.shape[1])
 
+        # --- Reconstruction loss ---
         loss_recon = mse_loss(source_recon, source_img) + mse_loss(target_recon, target_in)
-        total_recon_loss += loss_recon.item()
-        recon_loss_count += 1
 
-        # --- Contrastive Loss (SimSiam) ---
+        # --- Latent (ODE embedding consistency) ---
+        if latent_coeff > 0 and hasattr(model, "simsiam_project"):
+            z_src = model.simsiam_project(source_img_noisy)
+            z_tgt = model.simsiam_project(target_in_noisy)
+
+            latent_loss = F.mse_loss(
+                F.normalize(z_src, dim=1),
+                F.normalize(z_tgt, dim=1)
+            )
+        else:
+            latent_loss = torch.tensor(0.0, device=device)
+
+        # --- Contrastive loss ---
         if hasattr(model, 'simsiam_project') and hasattr(model, 'simsiam_predict'):
             z1 = model.simsiam_project(source_img)
             z2 = model.simsiam_project(target_in)
             p1, p2 = model.simsiam_predict(z1), model.simsiam_predict(z2)
-            
             loss_contrastive = neg_cos_sim(p1, z2)/2 + neg_cos_sim(p2, z1)/2
-
-            loss = loss_recon + contrastive_coeff * loss_contrastive
         else:
-            loss = loss_recon
+            loss_contrastive = torch.tensor(0.0, device=device)
+
+        # --- Invariance loss ---
+        if invariance_coeff > 0 and hasattr(model, "simsiam_project"):
+            aug_source = augment(source_img)
+            aug_target = augment(target_in)
+
+            z_src = model.simsiam_project(source_img)
+            z_src_aug = model.simsiam_project(aug_source)
+
+            z_tgt = model.simsiam_project(target_in)
+            z_tgt_aug = model.simsiam_project(aug_target)
+
+            loss_invariance = (
+                F.mse_loss(z_src, z_src_aug) +
+                F.mse_loss(z_tgt, z_tgt_aug)
+            ) / 2
+        else:
+            loss_invariance = torch.tensor(0.0, device=device)
+
+        # --- FINAL RECON LOSS ---
+        loss = loss_recon \
+             + contrastive_coeff * loss_contrastive \
+             + latent_coeff * latent_loss \
+             + invariance_coeff * loss_invariance
+        
+        # print("loss requires_grad:", loss.requires_grad)
 
         loss.backward()
+
+        clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if torch.isnan(loss):
+            print("⚠️ NaN loss detected, skipping batch")
+            continue
+
         optimizer.step()
         ema.update()
-        
-        # --- Prediction Loss (Time-Dependent) ---
+
+        total_recon_loss += loss_recon.item()
+        recon_loss_count += 1
+
+        # =========================================================
+        # === TIME-DEPENDENT PREDICTION PHASE =====================
+        # =========================================================
         if train_time_dependent:
             optimizer.zero_grad()
-            if hasattr(model, 'freeze_time_independent'):
-                model.freeze_time_independent()
 
             loss_pred = 0.0
             num_pred_groups = 0
+
             for t, mask in _iter_time_delta_groups(time_deltas):
                 scaled_t = t * t_multiplier
+
                 if smoothness_coeff > 0:
-                    predicted_target, smoothness_loss = model(source_img_noisy[mask], scaled_t, return_grad=True)
+                    predicted_target, smoothness_loss = model(
+                        source_img_noisy[mask], scaled_t, return_grad=True
+                    )
                 else:
                     predicted_target = model(source_img_noisy[mask], scaled_t)
                     smoothness_loss = 0.0
 
+                predicted_target = _match_channels(predicted_target, target_in[mask].shape[1])
+
                 if no_l2:
-                    pred_group_loss = smoothness_coeff * smoothness_loss + latent_coeff * 0.0
+                    pred_group_loss = smoothness_coeff * smoothness_loss
                 else:
-                    pred_group_loss = mse_loss(predicted_target, target_in[mask]) + smoothness_coeff * smoothness_loss
-                loss_pred = loss_pred + pred_group_loss
+                    pred = predicted_target
+                    target = target_in[mask]
+                    # print("pred shape:", pred.shape)
+                    # print("target shape:", target.shape)
+                    pred_group_loss = (
+                        mse_loss(pred, target) +
+                        smoothness_coeff * smoothness_loss
+                    )
+
+                loss_pred += pred_group_loss
                 num_pred_groups += 1
+
             loss_pred = loss_pred / max(num_pred_groups, 1)
-            
+
             loss_pred.backward()
             optimizer.step()
             ema.update()
@@ -1308,12 +1462,13 @@ def train_epoch(
             pred_loss_count += 1
 
         pbar.set_postfix(
-            recon_loss=total_recon_loss / (recon_loss_count if recon_loss_count > 0 else 1),
+            recon_loss=total_recon_loss / max(recon_loss_count, 1),
             pred_loss=total_pred_loss / pred_loss_count if pred_loss_count > 0 else "N/A"
         )
-    
-    avg_recon_loss = total_recon_loss / (recon_loss_count if recon_loss_count > 0 else 1)
+
+    avg_recon_loss = total_recon_loss / max(recon_loss_count, 1)
     avg_pred_loss = total_pred_loss / pred_loss_count if pred_loss_count > 0 else float('nan')
+
     return avg_recon_loss, avg_pred_loss
 
 
@@ -1334,12 +1489,15 @@ def val_epoch(model, loader, device, t_multiplier=1.0):
             # Reconstruction PSNR
             source_recon = model(source_img, t=t0)
             target_recon = model(target_in, t=t0)
+            source_recon = _match_channels(source_recon, source_img.shape[1])
+            target_recon = _match_channels(target_recon, target_in.shape[1])
             recon_psnr_metric.update(source_recon, source_img)
             recon_psnr_metric.update(target_recon, target_in)
 
             # Prediction PSNR
             for t, mask in _iter_time_delta_groups(time_deltas):
                 predicted_target = model(source_img[mask], t * t_multiplier)
+                predicted_target = _match_channels(predicted_target, target_in[mask].shape[1])
                 pred_psnr_metric.update(predicted_target, target_in[mask])
 
     avg_recon_psnr = recon_psnr_metric.compute().item()
@@ -2012,7 +2170,7 @@ def train_swinunetr_4fold_from_csv(
     base_dataset = FLAIREvolutionDataset(
         root_dir=root_dir,
         max_slices_per_patient=max_slices_per_patient,
-        use_wmh=True,
+        use_wmh=False,
         training_pairs=[(scan_name, scan_name, 0.0)],
         require_wmh_presence=require_wmh_presence,
         use_flair_output=False,
