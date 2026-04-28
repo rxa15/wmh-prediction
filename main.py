@@ -6,26 +6,20 @@ This script provides a unified interface to run different experiments via comman
 All experiments follow the same pipeline with cross-validation.
 
 Usage:
-    python main.py --exp 1  # Run Experiment BL: FLAIR ? FLAIR baseline
-    python main.py --exp 2  # Run Experiment 2: FLAIR ? FLAIR (two-stage, loss: L1 + SSIM)
-    python main.py --exp 3  # Run Experiment 3: FLAIR ? FLAIR (dense-pairs, loss: L1)
-    python main.py --exp 4 # Run Experiment 4: FLAIR ? FLAIR (dense-pairs, loss: L1 + SSIM)
-    python main.py --exp 5 # Run Experiment 5: FLAIR + WMH ? FLAIR (two-stage, loss: L1)
-    python main.py --exp 6 # Run Experiment 6: FLAIR + WMH ? FLAIR (two-stage, loss: L1 + SSIM)
-    python main.py --exp 7 # Run Experiment 7: FLAIR + WMH ? FLAIR (dense-pairs, loss: L1)
-    python main.py --exp 8 # Run Experiment 8: FLAIR + WMH ? FLAIR (dense-pairs, loss: L1 + SSIM)
-    python main.py --exp 9 # Run Experiment 9: FLAIR ? FLAIR (UNet baseline)
+    python main.py --exp 1  # BL
+    python main.py --exp 2  # L1
+    python main.py --exp 3  # ODEY-BL
+    python main.py --exp 4  # ODEM-BL
+    python main.py --exp 5  # ODEY-L1
+    python main.py --exp 6  # ODEM-L1
     
 Available Experiments:
-    1: FLAIR ? FLAIR baseline
-    2: FLAIR ? FLAIR (two-stage: prediction then segmentation, loss: L1 + SSIM)
-    3: FLAIR ? FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1)
-    4: FLAIR ? FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1 + SSIM)
-    5: FLAIR + WMH ? FLAIR (two-stage: prediction then segmentation, loss: L1)
-    6: FLAIR + WMH ? FLAIR (two-stage: prediction then segmentation, loss: L1 + SSIM)
-    7: FLAIR + WMH ? FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1)
-    8: FLAIR + WMH ? FLAIR (dense-pairs: all possible pairs) prediction with downstream WMH segmentation (loss: L1 + SSIM)
-    9: FLAIR ? FLAIR (UNet baseline)
+    1: BL
+    2: L1
+    3: ODEY-BL
+    4: ODEM-BL
+    5: ODEY-L1
+    6: ODEM-L1
     
 """
 
@@ -54,24 +48,52 @@ print(f"   - TF32 enabled: {torch.backends.cuda.matmul.allow_tf32}")
 print(f"   - cuDNN benchmark: {torch.backends.cudnn.benchmark}")
 
 # Import experiments directly (same folder)
-# from base import BaseExperiment
-from flair_to_flair import ExperimentBL
-# from flair_to_flair_contrastive import Experiment2
-# from flair_to_flair_dense_pairs_L1 import Experiment3
-# from flair_to_flair_dense_pairs_L1_SSIM import Experiment4
-# from flair_wmh_to_flair import Experiment5
-# from flair_wmh_to_flair_contrastive import Experiment6
-# from flair_wmh_to_flair_dense_pairs_L1 import Experiment7   
-# from flair_wmh_to_flair_dense_pairs_L1_SSIM import Experiment8
-# from flair_to_flair_unet_baseline import Experiment9
+from flair_to_flair_matrix import (
+    ExperimentBLAllPairs,
+    ExperimentL1AllPairs,
+    ExperimentODEYBL,
+    ExperimentODEMBL,
+    ExperimentODEYL1,
+    ExperimentODEML1,
+)
 
 # Registry of available experiments
 EXPERIMENTS = {
     1: {
         "name": "flair_to_flair_bl",
-        "description": "FLAIR -> FLAIR baseline",
+        "description": "BL: all possible time points with original ImageFlowNet loss",
         "use_wmh": True,
-        "class": ExperimentBL,
+        "class": ExperimentBLAllPairs,
+    },
+    2: {
+        "name": "flair_to_flair_l1",
+        "description": "L1: all possible time points + original ImageFlowNet loss + L1SSIM",
+        "use_wmh": True,
+        "class": ExperimentL1AllPairs,
+    },
+    3: {
+        "name": "flair_to_flair_odey_bl",
+        "description": "ODEY-BL: BL with ODE time scaling in years",
+        "use_wmh": True,
+        "class": ExperimentODEYBL,
+    },
+    4: {
+        "name": "flair_to_flair_odem_bl",
+        "description": "ODEM-BL: BL with ODE time scaling in months",
+        "use_wmh": True,
+        "class": ExperimentODEMBL,
+    },
+    5: {
+        "name": "flair_to_flair_odey_l1",
+        "description": "ODEY-L1: L1 variant with ODE time scaling in years",
+        "use_wmh": True,
+        "class": ExperimentODEYL1,
+    },
+    6: {
+        "name": "flair_to_flair_odem_l1",
+        "description": "ODEM-L1: L1 variant with ODE time scaling in months",
+        "use_wmh": True,
+        "class": ExperimentODEML1,
     },
 }
 
@@ -130,26 +152,20 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Available Experiments:
-  1: FLAIR ? FLAIR baseline
-  2: FLAIR ? FLAIR (two-stage, loss: L1 + SSIM)
-  3: FLAIR ? FLAIR (dense-pairs, loss: L1)
-  4: FLAIR ? FLAIR (dense-pairs, loss: L1 + SSIM)
-  5: FLAIR + WMH ? FLAIR (two-stage, loss: L1)
-  6: FLAIR + WMH ? FLAIR (two-stage, loss: L1 + SSIM)
-  7: FLAIR + WMH ? FLAIR (dense-pairs, loss: L1)
-  8: FLAIR + WMH ? FLAIR (dense-pairs, loss: L1 + SSIM)
-  9: FLAIR ? FLAIR (UNet baseline)
+    1: BL
+    2: L1
+    3: ODEY-BL
+    4: ODEM-BL
+    5: ODEY-L1
+    6: ODEM-L1
 
 Examples:
-  python main.py --exp 1    # Run Experiment BL
-  python main.py --exp 2    # Run Experiment 2
-  python main.py --exp 3    # Run Experiment 3
-  python main.py --exp 4    # Run Experiment 4
-  python main.py --exp 5    # Run Experiment 5
-  python main.py --exp 6    # Run Experiment 6
-  python main.py --exp 7    # Run Experiment 7
-  python main.py --exp 8    # Run Experiment 8
-  python main.py --exp 9    # Run Experiment 9
+    python main.py --exp 1    # Run BL
+    python main.py --exp 2    # Run L1
+    python main.py --exp 3    # Run ODEY-BL
+    python main.py --exp 4    # Run ODEM-BL
+    python main.py --exp 5    # Run ODEY-L1
+    python main.py --exp 6    # Run ODEM-L1
         """
     )
     parser.add_argument(

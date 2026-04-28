@@ -56,7 +56,12 @@ class ExperimentBL(BaseFlairToFlairExperiment):
         "random_seed": 42,
         "transform": True,
     }
+    ode_max_t_override = None
     run_title = "FLAIR → FLAIR (ImageFlowNet only loss)"
+
+    def _create_recon_loss(self):
+        """Factory method so variants can swap reconstruction loss while keeping the same pipeline."""
+        return nn.MSELoss()
 
     # def _diagnose_wmh(self, dataset):
     #     print("\n================ WMH DIAGNOSTIC ================")
@@ -186,9 +191,10 @@ class ExperimentBL(BaseFlairToFlairExperiment):
             max_epochs=self.config["NUM_EPOCHS"]
         )
         ema = ExponentialMovingAverage(model.parameters(), decay=0.9)
-        recon_loss = nn.MSELoss()
+        recon_loss = self._create_recon_loss()
         max_time_delta = self._get_stage1_max_time_delta(dataset=full_dataset)
-        t_multiplier = self.config.get("ODE_MAX_T", max_time_delta) / max_time_delta
+        ode_max_t = self.ode_max_t_override if self.ode_max_t_override is not None else self.config.get("ODE_MAX_T", max_time_delta)
+        t_multiplier = ode_max_t / max_time_delta
         self.config["T_MULTIPLIER"] = t_multiplier
         
         # Two-phase training: warmup with reconstruction, then full ODE training
